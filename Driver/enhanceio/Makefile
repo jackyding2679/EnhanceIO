@@ -8,24 +8,24 @@ KERNEL_TREE ?= /lib/modules/$(KERNEL_SOURCE_VERSION)/build
 EXTRA_CFLAGS += -I$(KERNEL_TREE)/drivers/md -I./ -DCOMMIT_REV="\"$(COMMIT_REV)\""
 EXTRA_CFLAGS += -I$(KERNEL_TREE)/include/ -I$(KERNEL_TREE)/include/linux 
 # Check for RHEL/CentOS
-RHEL5_VER ?= $(shell  if [ -e /etc/redhat-release ]; then grep 5.[0-9] /etc/redhat-release; else false; fi)
-RHEL5_SETUP :=
-ifneq "$(RHEL5_VER)" ""
-	RHEL5_SETUP := rhel5-setup
-	RHEL5_SPEC := /usr/src/redhat/SPECS/kernel.spec
-	RHEL5_TREE := /usr/src/redhat/BUILD/kernel-2.6.18/linux-$(shell uname -r).$(shell uname -i)
-	RHEL5_SRC := /usr/src/kernels/$(shell uname -r)-$(shell uname -i)
-	KERNEL_TREE := $(RHEL5_TREE)
-endif
+#RHEL5_VER ?= $(shell  if [ -e /etc/redhat-release ]; then grep 5.[0-9] /etc/redhat-release; else false; fi)
+#RHEL5_SETUP :=
+#ifneq "$(RHEL5_VER)" ""
+#	RHEL5_SETUP := rhel5-setup
+#	RHEL5_SPEC := /usr/src/redhat/SPECS/kernel.spec
+#	RHEL5_TREE := /usr/src/redhat/BUILD/kernel-2.6.18/linux-$(shell uname -r).$(shell uname -i)
+#	RHEL5_SRC := /usr/src/kernels/$(shell uname -r)-$(shell uname -i)
+#	KERNEL_TREE := $(RHEL5_TREE)
+#endif
 # Check for OpenVZ (/proc/vz)
-OPENVZ_VER ?= $(shell if [ -e /proc/vz ]; then grep 5.[0-9] /etc/redhat-release; else false; fi)
-ifneq "$(OPENVZ_VER)" ""
-        RHEL5_SPEC := /usr/src/redhat/SPECS/kernel-ovz.spec
-        RHEL5_TREE := /usr/src/redhat/BUILD/ovzkernel-2.6.18/linux-$(shell uname -r).$(shell uname -i)
-        KERNEL_TREE := $(RHEL5_TREE)
-endif
-obj-m	+= enhanceio.o enhanceio_lru.o enhanceio_fifo.o  enhanceio_rand.o
-enhanceio-y	+= \
+#OPENVZ_VER ?= $(shell if [ -e /proc/vz ]; then grep 5.[0-9] /etc/redhat-release; else false; fi)
+#ifneq "$(OPENVZ_VER)" ""
+#        RHEL5_SPEC := /usr/src/redhat/SPECS/kernel-ovz.spec
+#        RHEL5_TREE := /usr/src/redhat/BUILD/ovzkernel-2.6.18/linux-$(shell uname -r).$(shell uname -i)
+#        KERNEL_TREE := $(RHEL5_TREE)
+#endif
+obj-m	+= wssmartcache.o wssmartcache_lru.o wssmartcache_fifo.o  wssmartcache_rand.o
+wssmartcache-y	+= \
 	eio_conf.o \
 	eio_ioctl.o \
 	eio_main.o \
@@ -34,10 +34,10 @@ enhanceio-y	+= \
 	eio_procfs.o \
 	eio_setlru.o \
 	eio_subr.o \
-	eio_ttc.o
-enhanceio_fifo-y	+= eio_fifo.o
-enhanceio_rand-y	+= eio_rand.o
-enhanceio_lru-y	+= eio_lru.o
+	eio_ttc.o 
+wssmartcache_fifo-y	+= eio_fifo.o
+wssmartcache_rand-y	+= eio_rand.o
+wssmartcache_lru-y	+= eio_lru.o
 .PHONY: all
 all: modules 
 .PHONY:    modules

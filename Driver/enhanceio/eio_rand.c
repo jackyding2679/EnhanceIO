@@ -197,5 +197,5 @@ module_init(rand_register);
 module_exit(rand_unregister);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("RAND policy for EnhanceIO");
-MODULE_AUTHOR("STEC, Inc. based on code by Facebook");
+MODULE_DESCRIPTION("RAND policy for WSsmartcache");
+MODULE_AUTHOR("WS, Inc. based on code by Facebook");

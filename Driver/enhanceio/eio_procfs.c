@@ -28,7 +28,7 @@
  */
 
 #include "eio.h"
-#define EIO_RELEASE "ENHANCEIO"
+#define EIO_RELEASE "WSSMARTCACHE"
 
 #ifndef ENHANCEIO_GIT_COMMIT_HASH
 #define ENHANCEIO_GIT_COMMIT_HASH "unknown-git-version"
@@ -38,7 +38,7 @@ int eio_version_query(size_t buf_sz, char *bufp)
 {
 	if (unlikely(buf_sz == 0) || unlikely(bufp == NULL))
 		return -EINVAL;
-	snprintf(bufp, buf_sz, "EnhanceIO Version: %s %s (checksum disabled)",
+	snprintf(bufp, buf_sz, "WS-Smartcache Version: %s %s (checksum disabled)",
 		 EIO_RELEASE, ENHANCEIO_GIT_COMMIT_HASH);
 
 	bufp[buf_sz - 1] = '\0';
@@ -745,7 +745,8 @@ eio_time_based_clean_interval_sysctl(struct ctl_table *table, int write,
 		cancel_delayed_work_sync(&dmc->clean_aged_sets_work);
 		spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
 		dmc->is_clean_aged_sets_sched = 0;
-		if (dmc->sysctl_active.time_based_clean_interval
+		if (dmc->sysctl_active.enable_aged_clean
+			&& dmc->sysctl_active.time_based_clean_interval
 		    && atomic64_read(&dmc->nr_dirty)) {
 			schedule_delayed_work(&dmc->clean_aged_sets_work,
 					      dmc->sysctl_active.
@@ -758,6 +759,406 @@ eio_time_based_clean_interval_sysctl(struct ctl_table *table, int write,
 
 	return 0;
 }
+static int
+eio_enable_aged_clean_sysctl(struct ctl_table *table, int write,
+				     void __user *buffer, size_t *length,
+				     loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.enable_aged_clean =
+			dmc->sysctl_active.enable_aged_clean;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("enable_aged_clean is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.enable_aged_clean < 0) {
+			pr_err("enable_aged_clean is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.enable_aged_clean ==
+			dmc->sysctl_active.enable_aged_clean)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.enable_aged_clean =
+			dmc->sysctl_pending.enable_aged_clean;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
+		/*Apply new value*/
+		if (0 == dmc->sysctl_active.enable_aged_clean) {
+			if (dmc->is_clean_aged_sets_sched) {
+				cancel_delayed_work_sync(&dmc->clean_aged_sets_work);
+				spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
+				dmc->is_clean_aged_sets_sched = 0;
+				spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+			}
+		} else {
+			/*sched work*/
+			spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);			
+			if ((dmc->sysctl_active.time_based_clean_interval > 0) &&
+				(dmc->is_clean_aged_sets_sched == 0)) {
+				schedule_delayed_work(&dmc->clean_aged_sets_work,
+							  dmc->sysctl_active.
+							  time_based_clean_interval * 60 * HZ);
+				dmc->is_clean_aged_sets_sched = 1;
+			}
+			spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+		}
+	}
+
+	return 0;
+}
+
+static int
+eio_enable_sort_flush_sysctl(struct ctl_table *table, int write,
+						 void __user *buffer, size_t *length,
+						 loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.enable_sort_flush =
+			dmc->sysctl_active.enable_sort_flush;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("enable_sort_flush is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.enable_sort_flush < 0) {
+			pr_err("enable_sort_flush is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.enable_sort_flush ==
+			dmc->sysctl_active.enable_sort_flush)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.enable_sort_flush =
+			dmc->sysctl_pending.enable_sort_flush;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	return 0;
+}
+
+
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+/*
+ * enable_low_io_pressure_clean
+ */
+static int
+enable_low_io_pressure_cleane_sysctl(struct ctl_table *table, int write,
+			       void __user *buffer, size_t *length,
+			       loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.enable_low_io_pressure_clean =
+			dmc->sysctl_active.enable_low_io_pressure_clean;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("enable_low_io_pressure_clean is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.enable_low_io_pressure_clean < 0) {
+			pr_err("enable_low_io_pressure_clean is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.enable_low_io_pressure_clean ==
+		    dmc->sysctl_active.enable_low_io_pressure_clean)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.enable_low_io_pressure_clean =
+			dmc->sysctl_pending.enable_low_io_pressure_clean;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+
+		/*Apply new value*/
+		if (0 == dmc->sysctl_active.enable_low_io_pressure_clean) {
+			if (dmc->is_low_pressure_clean_work_sched) {
+				dmc->is_low_pressure_clean_work_sched = 0;
+				cancel_delayed_work_sync(&dmc->low_pressure_clean_work);
+			}
+		} else {
+			if (0 == dmc->is_low_pressure_clean_work_sched) {
+				schedule_delayed_work(&dmc->low_pressure_clean_work, \
+					dmc->low_io_pressure_sched_interval * HZ);
+				dmc->is_low_pressure_clean_work_sched = 1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * low_io_pressure_threshold_sysctl
+ */
+static int
+low_io_pressure_threshold_sysctl(struct ctl_table *table, int write,
+			       void __user *buffer, size_t *length,
+			       loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.low_io_pressure_threshold =
+			dmc->sysctl_active.low_io_pressure_threshold;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("low_io_pressure_threshold is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_threshold <= 0) {
+			pr_err("low_io_pressure_threshold is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_threshold ==
+		    dmc->sysctl_active.low_io_pressure_threshold)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.low_io_pressure_threshold =
+			dmc->sysctl_pending.low_io_pressure_threshold;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	return 0;
+}
+/*
+ * low_io_pressure_latency
+ */
+static int
+low_io_pressure_latency_sysctl(struct ctl_table *table, int write,
+			       void __user *buffer, size_t *length,
+			       loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.low_io_pressure_latency =
+			dmc->sysctl_active.low_io_pressure_latency;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("low_io_pressure_latency is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_latency <= 0) {
+			pr_err("low_io_pressure_latency is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_latency ==
+		    dmc->sysctl_active.low_io_pressure_latency)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.low_io_pressure_latency =
+			dmc->sysctl_pending.low_io_pressure_latency;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	return 0;
+}
+
+/*
+ * low_io_pressure_clean_set_nr_sysctl
+ */
+static int
+low_io_pressure_clean_set_nr_sysctl(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.low_io_pressure_clean_set_nr =
+			dmc->sysctl_active.low_io_pressure_clean_set_nr;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("low_io_pressure_clean_set_nr is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_clean_set_nr <= 0) {
+			pr_err("low_io_pressure_clean_set_nr is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_clean_set_nr ==
+			dmc->sysctl_active.low_io_pressure_clean_set_nr)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.low_io_pressure_clean_set_nr =
+			dmc->sysctl_pending.low_io_pressure_clean_set_nr;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	return 0;
+}
+/*
+ * low_io_pressure_dirty_threshold_sysctl
+ */
+static int
+low_io_pressure_dirty_threshold_sysctl(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.low_io_pressure_dirty_threshold =
+			dmc->sysctl_active.low_io_pressure_dirty_threshold;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("low_io_pressure_dirty_threshold is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_dirty_threshold < 0) {
+			pr_err("low_io_pressure_dirty_threshold is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.low_io_pressure_dirty_threshold ==
+			dmc->sysctl_active.low_io_pressure_dirty_threshold)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.low_io_pressure_dirty_threshold =
+			dmc->sysctl_pending.low_io_pressure_dirty_threshold;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	return 0;
+}
+#endif
+
+#ifdef ENABLE_TIME_BASED_CLEAN
+static int
+enable_time_based_clean_sysctl(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos)
+{
+}
+#endif
 
 static void eio_sysctl_register_writeback(struct cache_c *dmc);
 static void eio_sysctl_unregister_writeback(struct cache_c *dmc);
@@ -922,12 +1323,13 @@ eio_control_sysctl(struct ctl_table *table, int write, void __user *buffer,
 	return rv;
 }
 
-#define PROC_STR                "enhanceio"
-#define PROC_VER_STR            "enhanceio/version"
+#define PROC_STR                "wssmartcache"
+#define PROC_VER_STR            "wssmartcache/version"
 #define PROC_STATS              "stats"
 #define PROC_ERRORS             "errors"
 #define PROC_IOSZ_HIST          "io_hist"
 #define PROC_CONFIG             "config"
+#define PROC_DBG_CTR			"dbg_ctr"
 
 static int eio_invalidate_sysctl(struct ctl_table *table, int write,
 				 void __user *buffer, size_t *length,
@@ -950,6 +1352,13 @@ static int eio_version_show(struct seq_file *seq, void *v);
 static int eio_version_open(struct inode *inode, struct file *file);
 static int eio_config_show(struct seq_file *seq, void *v);
 static int eio_config_open(struct inode *inode, struct file *file);
+static int eio_dbg_ctr_open(struct inode *inode, struct file *file);
+static int eio_dbg_ctr_show(struct seq_file *seq, void *v);
+static ssize_t eio_dbg_ctr_write(struct file *file,
+						  const char __user *user_buf,
+						  size_t count, loff_t *ppos);
+
+//int eio_dbg_ctr = 0;
 
 static const struct file_operations eio_version_operations = {
 	.open		= eio_version_open,
@@ -986,6 +1395,15 @@ static const struct file_operations eio_config_operations = {
 	.release	= single_release,
 };
 
+static const struct file_operations eio_dbg_ctr_operations = {
+	.open		= eio_dbg_ctr_open,
+	.write      = eio_dbg_ctr_write,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+
 /*
  * Each ctl_table array needs to be 1 more than the actual number of
  * entries - zero padded at the end ! Therefore the NUM_*_SYSCTLS
@@ -993,8 +1411,8 @@ static const struct file_operations eio_config_operations = {
  */
 
 #define PROC_SYS_ROOT_NAME              "dev"
-#define PROC_SYS_DIR_NAME               "enhanceio"
-#define PROC_SYS_CACHE_NAME             "enhanceio-dev"
+#define PROC_SYS_DIR_NAME               "wssmartcache"
+#define PROC_SYS_CACHE_NAME             "wssmartcache-dev"
 
 /*
  * The purpose of sysctl_table_dir is to create the "enhanceio"
@@ -1085,7 +1503,7 @@ static struct sysctl_table_common {
 	},
 };
 
-#define NUM_WRITEBACK_SYSCTLS   7
+#define NUM_WRITEBACK_SYSCTLS   9 + LOW_IO_PRESSURE_SYSCTL_NR
 
 static struct sysctl_table_writeback {
 	struct ctl_table_header *sysctl_header;
@@ -1135,6 +1553,50 @@ static struct sysctl_table_writeback {
 			.proc_handler	= &eio_dirty_set_low_threshold_sysctl,
 		}
 		,
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+		{               /* 8 */
+			.procname	= "enable_low_io_pressure_clean",
+			.maxlen		= sizeof(int),
+			.mode		= 0644,
+			.proc_handler	= &enable_low_io_pressure_cleane_sysctl,
+		},
+		{               /* 9 */
+			.procname	= "low_io_pressure_threshold",
+			.maxlen		= sizeof(uint32_t),
+			.mode		= 0644,
+			.proc_handler	= &low_io_pressure_threshold_sysctl,
+		},
+		{               /* 10 */
+			.procname	= "low_io_pressure_clean_set_nr",
+			.maxlen		= sizeof(uint32_t),
+			.mode		= 0644,
+			.proc_handler	= &low_io_pressure_clean_set_nr_sysctl,
+		},
+		{               /* 11 */
+			.procname	= "low_io_pressure_dirty_threshold",
+			.maxlen		= sizeof(uint32_t),
+			.mode		= 0644,
+			.proc_handler	= &low_io_pressure_dirty_threshold_sysctl,
+		},
+		{               /* 12 */
+			.procname	= "low_io_pressure_latency",
+			.maxlen		= sizeof(uint32_t),
+			.mode		= 0644,
+			.proc_handler	= &low_io_pressure_latency_sysctl,
+		},
+#endif
+		{	/* 13 */
+			.procname	= "enable_sort_flush",
+			.maxlen 	= sizeof(int),
+			.mode		= 0644,
+			.proc_handler	= &eio_enable_sort_flush_sysctl,
+		},
+		{	/* 14 */
+			.procname	= "enable_aged_clean",
+			.maxlen 	= sizeof(int),
+			.mode		= 0644,
+			.proc_handler	= &eio_enable_aged_clean_sysctl,
+		},
 	}
 	, .dev = {
 		{
@@ -1270,6 +1732,11 @@ void eio_procfs_ctr(struct cache_c *dmc)
 	entry = proc_create_data(s, 0, NULL, &eio_config_operations, dmc);
 	kfree(s);
 
+	/*add eio dbg_ctr*/
+	s = eio_cons_procfs_cachename(dmc, PROC_DBG_CTR);
+	entry = proc_create_data(s, 0, NULL, &eio_dbg_ctr_operations, dmc);
+	kfree(s);
+
 	eio_sysctl_register_common(dmc);
 	if (dmc->mode == CACHE_MODE_WB)
 		eio_sysctl_register_writeback(dmc);
@@ -1297,6 +1764,10 @@ void eio_procfs_dtr(struct cache_c *dmc)
 	kfree(s);
 
 	s = eio_cons_procfs_cachename(dmc, PROC_CONFIG);
+	remove_proc_entry(s, NULL);
+	kfree(s);
+	/*remove dbg_ctr*/
+	s = eio_cons_procfs_cachename(dmc, PROC_DBG_CTR);
 	remove_proc_entry(s, NULL);
 	kfree(s);
 
@@ -1414,6 +1885,23 @@ static void *eio_find_sysctl_data(struct cache_c *dmc, struct ctl_table *vars)
 		return (void *)&dmc->sysctl_pending.control;
 	if (strcmp(vars->procname, "invalidate") == 0)
 		return (void *)&dmc->sysctl_pending.invalidate;
+
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	if (strcmp(vars->procname, "enable_low_io_pressure_clean") == 0)
+		return (void *)&dmc->sysctl_pending.enable_low_io_pressure_clean;
+	if (strcmp(vars->procname, "low_io_pressure_threshold") == 0)
+		return (void *)&dmc->sysctl_pending.low_io_pressure_threshold;
+	if (strcmp(vars->procname, "low_io_pressure_latency") == 0)
+		return (void *)&dmc->sysctl_pending.low_io_pressure_latency;
+	if (strcmp(vars->procname, "low_io_pressure_clean_set_nr") == 0)
+		return (void *)&dmc->sysctl_pending.low_io_pressure_clean_set_nr;
+	if (strcmp(vars->procname, "low_io_pressure_dirty_threshold") == 0)
+		return (void *)&dmc->sysctl_pending.low_io_pressure_dirty_threshold;
+#endif
+	if (strcmp(vars->procname, "enable_aged_clean") == 0)
+		return (void *)&dmc->sysctl_pending.enable_aged_clean;
+	if (strcmp(vars->procname, "enable_sort_flush") == 0)
+		return (void *)&dmc->sysctl_pending.enable_sort_flush;
 
 	pr_err("Cannot find sysctl data for %s", vars->procname);
 	return NULL;
@@ -1792,6 +2280,10 @@ static int eio_stats_show(struct seq_file *seq, void *v)
 		   (int64_t)atomic64_read(&stats->rdtime_ms));
 	seq_printf(seq, "%-26s %12lld\n", "wrtime_ms",
 		   (int64_t)atomic64_read(&stats->wrtime_ms));
+	seq_printf(seq, "%-26s %12lld\n", "nr_ios",
+		    (int64_t)atomic64_read(&dmc->nr_ios));
+	seq_printf(seq, "%-26s %12lld\n", "clean_pendings",
+		    (int64_t)atomic64_read(&dmc->clean_pendings));
 	return 0;
 }
 
@@ -1918,6 +2410,26 @@ static int eio_config_show(struct seq_file *seq, void *v)
 		   : (CACHE_FAILED_IS_SET(dmc) ? "failed" : "normal"));
 	seq_printf(seq, "flags      0x%08x\n", dmc->cache_flags);
 
+	seq_printf(seq, "clean_n_sets      %d\n", NR_CLEAN_SET);
+
+	return 0;
+}
+
+static int eio_dbg_ctr_show(struct seq_file *seq, void *v)
+{
+	struct cache_c *dmc = seq->private;
+
+	if (EIO_LOG_LEVEL_OFF == dmc->log_level) {
+		seq_printf(seq, "DEBUG LEVEL: OFF\n");
+	} else if(EIO_LOG_LEVEL_ERROR == dmc->log_level) {
+		seq_printf(seq, "DEBUG LEVEL: ERROR\n");
+	} else if(EIO_LOG_LEVEL_INFO == dmc->log_level) {
+		seq_printf(seq, "DEBUG LEVEL: INFO\n");
+	}else if(EIO_LOG_LEVEL_DEBUG == dmc->log_level) {
+		seq_printf(seq, "DEBUG LEVEL: DEBUG\n");
+	} else {
+		seq_printf(seq, "DEBUG LEVEL: UNKNOWN\n");
+	}
 	return 0;
 }
 
@@ -1929,3 +2441,50 @@ static int eio_config_open(struct inode *inode, struct file *file)
 
 	return single_open(file, &eio_config_show, PDE_DATA(inode));
 }
+/*
+ * eio_dbg_ctr_open
+ */
+static int eio_dbg_ctr_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, &eio_dbg_ctr_show, PDE_DATA(inode));
+}
+
+/*
+ * eio_dbg_ctr_write
+ *
+ * EIO_LOG_LEVEL_ERROR: echo 1  > /proc/enhanceio/cachename/dbg_ctr
+ * EIO_LOG_LEVEL_INFO : echo 2  > /proc/enhanceio/cachename/dbg_ctr
+ * EIO_LOG_LEVEL_DEBUG: echo 3  > /proc/enhanceio/cachename/dbg_ctr
+ * EIO_LOG_LEVEL_OFF  : echo 0  > /proc/enhanceio/cachename/dbg_ctr
+ */
+static ssize_t eio_dbg_ctr_write(struct file *file,
+				      const char __user *user_buf,
+				      size_t count, loff_t *ppos)
+{
+	struct cache_c *dmc = PDE_DATA(file_inode(file));
+	unsigned int user_val;
+	int err;
+
+	err = kstrtouint_from_user(user_buf, count, 0, &user_val);
+	if (err) {
+		pr_err("eio_dbg_ctr_write error\n");
+		return err;
+	}
+
+	if (EIO_LOG_LEVEL_OFF == user_val) {
+		dmc->log_level = EIO_LOG_LEVEL_OFF;
+	} else if(EIO_LOG_LEVEL_ERROR == user_val) {
+		dmc->log_level = EIO_LOG_LEVEL_ERROR;
+	} else if(EIO_LOG_LEVEL_INFO == user_val) {
+		dmc->log_level = EIO_LOG_LEVEL_INFO;
+	}else if(EIO_LOG_LEVEL_DEBUG == user_val) {
+		dmc->log_level = EIO_LOG_LEVEL_DEBUG;
+	} else {
+		pr_err("eio_dbg_ctr_write:unknown debug level!\n");
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+

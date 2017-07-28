@@ -139,6 +139,22 @@ long eio_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
 		break;
 
 	case EIO_IOC_SRC_ADD:
+	#ifdef CONFIG_SRC_ADD_RESUME
+		cache = vmalloc(sizeof(struct cache_rec_short));
+		if (!cache)
+			return -ENOMEM;
+
+		if (copy_from_user(cache, (void __user *)arg,
+				   sizeof(struct cache_rec_short))) {
+			vfree(cache);
+			return -EFAULT;
+		}
+		pr_info("eio_ioctl: cachename:[%s], src_devname[%s], ssd_devname[%s].\n", 
+			cache->cr_name, cache->cr_src_devname, cache->cr_ssd_devname);
+		note = NOTIFY_SRC_ADD;
+		error = eio_handle_src_message(cache->cr_name, 
+							cache->cr_src_devname, note);
+	#endif
 		break;
 
 	case EIO_IOC_NOTIFY_REBOOT:

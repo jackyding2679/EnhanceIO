@@ -101,7 +101,7 @@ int eio_wait_schedule(void *unused)
 	return 0;
 }
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,15,0))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,15,0) && LINUX_VERSION_CODE != KERNEL_VERSION(3,10,0))
 #define smp_mb__after_atomic smp_mb__after_clear_bit
 #endif
 
@@ -1434,6 +1434,7 @@ static void eio_init_ssddev_props(struct cache_c *dmc)
 	max_nr_pages = (u_int32_t)bio_get_nr_vecs(dmc->cache_dev->bdev);
 	nr_pages = min_t(u_int32_t, max_hw_sectors, max_nr_pages);
 	dmc->bio_nr_pages = nr_pages;
+	pr_info("bio_nr_pages is %d\n", dmc->bio_nr_pages);
 
 	/*
 	 * If the cache device is not a physical device (eg: lv), then
@@ -1449,6 +1450,7 @@ static void eio_init_ssddev_props(struct cache_c *dmc)
 		strncpy(dmc->cache_gendisk_name,
 			dev_name(dmc->cache_dev->bdev->bd_disk->driverfs_dev),
 			DEV_PATHLEN);
+		pr_info("cache_gendisk_name:%s, cache_devname:%s\n", dmc->cache_gendisk_name, dmc->cache_devname);
 	} else
 		dmc->cache_gendisk_name[0] = '\0';
 }
@@ -1462,9 +1464,203 @@ static void eio_init_srcdev_props(struct cache_c *dmc)
 		strncpy(dmc->cache_srcdisk_name,
 			dev_name(dmc->disk_dev->bdev->bd_disk->driverfs_dev),
 			DEV_PATHLEN);
+		pr_info("cache_srcdisk_name:%s, disk_devname:%s\n", 
+				dmc->cache_srcdisk_name, dmc->disk_devname);
 	} else
 		dmc->cache_srcdisk_name[0] = '\0';
 }
+#ifdef CONFIG_SRC_ADD_RESUME
+int eio_ctr_src_add(struct cache_c *dmc, char *dev)
+{
+	int ret;
+	struct eio_bdev *prev_src_dev = NULL;	
+	fmode_t mode = (FMODE_READ | FMODE_WRITE);
+	sector_t end_sector;
+	int devname_changed = 0;
+	int i;
+	u_int32_t cached_block_nr = 0;
+
+	if (dmc == NULL || dev == NULL) {
+		pr_err("eio_ctr_src_add: Null device or cache instance.\n");
+		return -EINVAL;
+	}
+	if (strlen(dev) >= DEV_PATHLEN) {
+		pr_err("eio_ctr_src_add: Device name %s too long.\n", dev);
+		return -EINVAL;
+	}
+
+	if (CACHE_STALE_IS_SET(dmc)) {
+		pr_err("eio_ctr_src_add: Cache is deleting"
+		       "Cache \"%s\" can not be resumed.", dmc->cache_name);
+		return -EINVAL;
+	}
+
+	/* sanity check for writeback */
+	if (dmc->mode == CACHE_MODE_WB) {
+		if (!CACHE_FAILED_IS_SET(dmc) || CACHE_SSD_IS_ABSENT(dmc) ||
+			CACHE_SSD_ADD_INPROG_IS_SET(dmc)) {
+			pr_err("eio_ctr_src_add: Cache not in Failed "
+				 "state or Source is absent"
+				 "or SSD add already in progress for cache \"%s\".\n",
+				 dmc->cache_name);
+			return -EINVAL;
+		}
+	} else {
+		//TODO		
+		pr_info("eio_ctr_src_add:not wb mode,TODO...\n");
+		return 0;
+	}
+
+	/*check flag no_cache_dev*/
+	if (1 == dmc->eio_errors.no_cache_dev){
+		pr_err("eio_ctr_src_add:Flag no_cache_dev is true.\n");
+		return -EINVAL;
+	}
+
+	/*check src dev*/
+	if (!strcmp(dev, dmc->disk_devname)) {
+		pr_info("eio_ctr_src_add: Source device name is the same.\n");
+	} else {
+		pr_info("eio_ctr_src_add: Source device name changed from %s to %s.\n", 
+				dmc->disk_devname, dev);
+		devname_changed = 1;
+		prev_src_dev = dmc->disk_dev;
+		/*open src dev*/
+		ret = eio_ttc_get_device(dev, mode, &dmc->disk_dev);
+		if (ret) {
+			pr_err("eio_ctr_src_add: Failed to lookup and open disk device %s.\n", dev);
+			return -EINVAL;
+		}
+		/*put prev src dev*/		
+		//eio_ttc_put_device(&prev_src_dev);
+	}
+
+	/*check src size,start_sector and end_sector*/
+	if (dmc->disk_size != eio_to_sector(eio_get_device_size(dmc->disk_dev))){
+		pr_err("eio_ctr_src_add: Source device size has changed," \
+		       "expected (%llu) found (%llu)" \
+		       "continuing in failed mode",
+		       (unsigned long long)dmc->disk_size,
+		       (unsigned long long)eio_to_sector(
+			       eio_get_device_size(dmc->disk_dev)));		
+		ret = -EINVAL;
+		goto err;
+	}
+	if (dmc->dev_start_sect != dmc->disk_dev->bdev->bd_part->start_sect) {
+		pr_err("eio_ctr_src_add: Source device start sector has changed," \
+		       "expected (%llu) found (%llu)" \
+		       "continuing in failed mode",
+		       (unsigned long long)dmc->dev_start_sect,
+		       (unsigned long long)dmc->disk_dev->bdev->bd_part->start_sect);		
+		ret = -EINVAL;
+		goto err;
+	}
+	end_sector = dmc->disk_dev->bdev->bd_part->start_sect + 
+				dmc->disk_dev->bdev->bd_part->nr_sects - 1;
+	if (dmc->dev_end_sect != end_sector) {
+		pr_err("eio_ctr_src_add: Source device end sector has changed," \
+		       "expected (%llu) found (%llu)" \
+		       "continuing in failed mode",
+		       (unsigned long long)dmc->dev_end_sect,
+		       (unsigned long long)end_sector);		
+		ret = -EINVAL;
+		goto err;
+	}
+	
+	/*scan metadata to calc VALID block number*/
+	if (EIO_MD8(dmc)) {
+		for (i = 0; i < dmc->size; i++) {
+			if (dmc->cache_md8[i].md8_u.u_s_md8.cache_state & VALID) {
+				cached_block_nr++;
+			}
+		}
+	} else {
+		for (i = 0; i < dmc->size; i++) {
+			if (dmc->cache[i].md4_u.u_s_md4.cache_state & VALID) {
+				cached_block_nr++;
+			}
+		}
+	}
+	pr_info("eio_ctr_src_add: Scaned md cached_block_nr:%u\n", cached_block_nr);
+	pr_info("eio_ctr_src_add: EIO stats cached_blocks_nr:%u\n", dmc->cached_blocks_tmp);
+	atomic64_set(&dmc->eio_stats.cached_blocks, cached_block_nr);
+	
+	/*active eio*/
+	ret = eio_activate_src_add(dmc, prev_src_dev);
+	if (ret) {
+		pr_err("eio_ctr_src_add: EIO activate filed\n");
+		goto err;
+	}
+
+	/*copy devname*/	
+	if (devname_changed) {
+		strncpy(dmc->disk_devname, dev, DEV_PATHLEN);		
+		eio_init_srcdev_props(dmc);
+	}
+	dmc->eio_errors.no_source_dev = 0;
+	if (dmc->mode != CACHE_MODE_WB) {
+		//TODO		
+		pr_info("eio_ctr_src_add: Cache mode is not WB,TODO...\n");
+		return 0;
+	} else {
+		dmc->cache_flags &= ~CACHE_FLAGS_FAILED;
+		pr_info("eio_ctr_src_add: Cache %s is restored to ACTIVE mode.\n",
+			dmc->cache_name);
+	}
+
+	/*start low io pressure clean*/	
+	#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+		if (dmc->sysctl_active.enable_low_io_pressure_clean) {
+			/*sched low io presssure clean work*/
+			if (0 == dmc->is_low_pressure_clean_work_sched) {
+				schedule_delayed_work(&dmc->low_pressure_clean_work, \
+										dmc->low_io_pressure_sched_interval * HZ);
+				dmc->is_low_pressure_clean_work_sched = 1;
+			}
+		}
+	#endif
+
+	return 0;
+	
+err:
+	eio_ttc_put_device(&dmc->disk_dev);	
+	return ret;
+}
+
+
+/* handle source device add */
+int
+eio_handle_src_message(char *cache_name, char *src_name, enum dev_notifier note)
+{
+	struct cache_c *dmc;
+	
+	dmc = eio_cache_lookup(cache_name);
+	if (NULL == dmc) {
+		pr_err("eio_handle_src_message: Cache %s does not exist.",
+		       cache_name);
+		return -EINVAL;
+	}
+
+	switch (note) {
+
+	case NOTIFY_SRC_ADD:
+		/* Making sure that CACHE state is not active */
+		if (CACHE_FAILED_IS_SET(dmc) || CACHE_DEGRADED_IS_SET(dmc)) {
+			eio_ctr_src_add(dmc, src_name);
+		} else {
+			pr_err
+				("eio_handle_src_message: SRC_ADD event called for ACTIVE cache \"%s\", ignoring!!!",
+				dmc->cache_name);
+		}
+		break;
+	default:
+		pr_err("Wrong notifier passed for eio_handle_src_message.\n");
+	}
+
+	return 0;
+
+}
+#endif
 
 int eio_cache_create(struct cache_rec_short *cache)
 {
@@ -1788,6 +1984,25 @@ int eio_cache_create(struct cache_rec_short *cache)
 	}
 
 init:
+	
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	dmc->sysctl_active.enable_low_io_pressure_clean = ENABLE_LOW_IO_PRESSURE_CLEAN;
+	dmc->sysctl_active.low_io_pressure_threshold = LOW_IO_PRESSURE_THRESHOLD;	
+	dmc->sysctl_active.low_io_pressure_latency = LOW_IO_LATENCY_THRESHOLD;
+	dmc->sysctl_active.low_io_pressure_clean_set_nr = LOW_IO_PRESSURE_CLEAN_SET_NR;
+	dmc->sysctl_active.low_io_pressure_dirty_threshold = LOW_IO_PRESSURE_DIRTY_THRESHOLD;
+#endif
+	dmc->sysctl_active.enable_aged_clean = DISABLE_AGED_CLEAN;
+	dmc->sysctl_active.enable_sort_flush = ENABLE_SORT_FLUSH;
+	/*dbg ctl*/
+	dmc->log_level = EIO_LOG_LEVEL_OFF;
+	
+	/*fix issues 2253*/
+	spin_lock_init(&dmc->bc_free_lock);
+	spin_lock_init(&dmc->bc_id_lock);
+	init_rwsem(&dmc->muti_set_op_protect);
+	dmc->bc_id = 1;
+
 	order = (dmc->size >> dmc->consecutive_shift) *
 		sizeof(struct cache_set);
 
@@ -2060,6 +2275,11 @@ force_delete:
 	}
 
 	eio_free_wb_resources(dmc);
+	if (dmc->callback_q) {
+		flush_workqueue(dmc->callback_q);
+		destroy_workqueue(dmc->callback_q);
+		dmc->callback_q = NULL;
+	}
 	vfree((void *)EIO_CACHE(dmc));
 	vfree((void *)dmc->cache_sets);
 	eio_ttc_put_device(&dmc->disk_dev);
@@ -2233,6 +2453,10 @@ void eio_stop_async_tasks(struct cache_c *dmc)
 		 */
 		dmc->sysctl_active.time_based_clean_interval = 0;
 		cancel_delayed_work_sync(&dmc->clean_aged_sets_work);
+		
+	#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+		cancel_delayed_work_sync(&dmc->low_pressure_clean_work);
+	#endif
 	}
 }
 
@@ -2260,7 +2484,9 @@ int eio_allocate_wb_resources(struct cache_c *dmc)
 	EIO_ASSERT(dmc->clean_mdpages == NULL);
 	EIO_ASSERT(dmc->dbvec_count == 0);
 	EIO_ASSERT(dmc->mdpage_count == 0);
-
+	EIO_ASSERT(dmc->clean_n_sets_dbvecs == NULL);
+	EIO_ASSERT(dmc->sort_array == NULL);
+	EIO_ASSERT(dmc->dbvec_count_n_sets == 0);
 	/* Data page allocations are done in terms of "bio_vec" structures */
 	iosize = (dmc->block_size * dmc->assoc) << SECTOR_SHIFT;
 	nr_bvecs = IO_BVEC_COUNT(iosize, dmc->block_size);
@@ -2269,14 +2495,62 @@ int eio_allocate_wb_resources(struct cache_c *dmc)
 	if (dmc->clean_dbvecs == NULL) {
 		pr_err("cache_create: Failed to allocated memory.\n");
 		ret = -ENOMEM;
-		goto errout;
+		goto out;
 	}
 	/* Allocate pages for each bio_vec */
 	ret = eio_alloc_wb_bvecs(dmc->clean_dbvecs, nr_bvecs, dmc->block_size);
-	if (ret)
-		goto errout;
+	if (ret) {
+		pr_err("cache_create: Failed to allocate clean_dbvecs.\n");
+		goto err1;
+	}
 	EIO_ASSERT(dmc->clean_dbvecs != NULL);
 	dmc->dbvec_count = nr_bvecs;
+    /*Data page allocation for clean n sets*/
+	iosize = (dmc->block_size * dmc->assoc) << SECTOR_SHIFT ;
+	iosize <<= NR_CLEAN_SET_SHIFT;
+	nr_bvecs = IO_BVEC_COUNT(iosize, dmc->block_size);
+	dmc->clean_n_sets_dbvecs = kmalloc(sizeof(struct bio_vec) * nr_bvecs,
+				GFP_KERNEL);
+	if (dmc->clean_n_sets_dbvecs == NULL) {
+		pr_err("cache_create: Failed to allocated memory for clean n sets.\n");
+		ret = -ENOMEM;
+		goto err2;
+	}
+	/* Allocate pages for each bio_vec */
+	ret = eio_alloc_wb_bvecs(dmc->clean_n_sets_dbvecs, nr_bvecs, dmc->block_size);
+	if (ret) {	
+		pr_err("cache_create: Failed to allocate clean_n_sets_dbvecs.\n");
+		goto err3;
+	}
+	EIO_ASSERT(dmc->clean_n_sets_dbvecs != NULL);
+	dmc->dbvec_count_n_sets = nr_bvecs;
+
+	/*alloc heapsort memory*/
+	dmc->sort_array = 
+			kmalloc(sizeof(struct dbn_index_pair) * NR_CLEAN_SET * dmc->assoc, 
+				GFP_KERNEL);
+	if (dmc->sort_array == NULL) {
+		pr_err("cache_create: Failed to allocated memory sort_array.\n");
+		ret = -ENOMEM;	
+		goto err4;
+	}
+	/*init low disk pressure clean work*/
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	dmc->is_low_pressure_clean_work_sched = 0;
+	atomic_set(&dmc->flag_rm_sets, 0);
+	dmc->low_io_pressure_sched_interval = WORK_SCHED_INTERVAL;
+	dmc->last_ioc = -1;
+	dmc->scan_head = 1;
+	dmc->lowp_cnt = 0;
+	INIT_DELAYED_WORK(&dmc->low_pressure_clean_work, eio_clean_low_io_pressure);
+	dmc->set_dirty_sort = kmalloc(sizeof(struct set_nr_dirty_pair) * \
+						SORT_SET_NR, GFP_KERNEL);
+	if (NULL == dmc->set_dirty_sort) {
+		pr_err("cache_create: Failed to allocated memory set_dirty_sort.\n");
+		ret = -ENOMEM;	
+		goto err5;
+	}
+#endif
 
 	/* Metadata page allocations are done in terms of pages only */
 	iosize = dmc->assoc * sizeof(struct flash_cacheblock);
@@ -2284,17 +2558,14 @@ int eio_allocate_wb_resources(struct cache_c *dmc)
 	dmc->clean_mdpages = kmalloc(sizeof(struct page *) * nr_pages,
 				GFP_KERNEL);
 	if (dmc->clean_mdpages == NULL) {
-		pr_err("cache_create: Failed to allocated memory.\n");
-		ret = -ENOMEM;
-		eio_free_wb_bvecs(dmc->clean_dbvecs, dmc->dbvec_count,
-				  dmc->block_size);
-		goto errout;
+		pr_err("cache_create: Failed to allocated memory clean_mdpages.\n");
+		ret = -ENOMEM;	
+		goto err6;
 	}
 	ret = eio_alloc_wb_pages(dmc->clean_mdpages, nr_pages);
 	if (ret) {
-		eio_free_wb_bvecs(dmc->clean_dbvecs, dmc->dbvec_count,
-				  dmc->block_size);
-		goto errout;
+		pr_err("cache_create: Failed to allocated pages clean_mdpages.\n");	
+		goto err7;
 	}
 	EIO_ASSERT(dmc->clean_mdpages != NULL);
 	dmc->mdpage_count = nr_pages;
@@ -2325,9 +2596,10 @@ int eio_allocate_wb_resources(struct cache_c *dmc)
 	}
 	EIO_ASSERT(dmc->mdupdate_q == NULL);
 	dmc->mdupdate_q = create_singlethread_workqueue("eio_mdupdate");
-	if (!dmc->mdupdate_q)
+	if (!dmc->mdupdate_q) {
 		ret = -ENOMEM;
-
+	}
+	
 	if (ret < 0) {
 		pr_err("cache_create: Failed to initialize dirty lru set or" \
 		       "clean/mdupdate thread for wb cache.\n");
@@ -2335,27 +2607,47 @@ int eio_allocate_wb_resources(struct cache_c *dmc)
 			lru_uninit(dmc->dirty_set_lru);
 			dmc->dirty_set_lru = NULL;
 		}
-
-		eio_free_wb_pages(dmc->clean_mdpages, dmc->mdpage_count);
-		eio_free_wb_bvecs(dmc->clean_dbvecs, dmc->dbvec_count,
-				  dmc->block_size);
-		goto errout;
+		goto err7;
 	}
 
 	goto out;
 
-errout:
+err7:
 	if (dmc->clean_mdpages) {
 		kfree(dmc->clean_mdpages);
 		dmc->clean_mdpages = NULL;
 		dmc->mdpage_count = 0;
 	}
+err6:
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	if (dmc->set_dirty_sort ) {
+		kfree(dmc->set_dirty_sort);
+		dmc->set_dirty_sort = NULL;
+	}
+#endif
+err5:
+	if(dmc->sort_array) {
+		kfree(dmc->sort_array);
+		dmc->sort_array = NULL;
+	}
+err4:	
+	eio_free_wb_bvecs(dmc->clean_n_sets_dbvecs, dmc->dbvec_count_n_sets,
+			  dmc->block_size);
+err3:
+	if (dmc->clean_n_sets_dbvecs) {
+		kfree(dmc->clean_n_sets_dbvecs);
+		dmc->clean_n_sets_dbvecs = NULL;
+		dmc->dbvec_count_n_sets = 0;
+	}
+err2:	
+	eio_free_wb_bvecs(dmc->clean_dbvecs, dmc->dbvec_count,
+			  dmc->block_size);
+err1:
 	if (dmc->clean_dbvecs) {
 		kfree(dmc->clean_dbvecs);
 		dmc->clean_dbvecs = NULL;
 		dmc->dbvec_count = 0;
 	}
-
 out:
 	return ret;
 }
@@ -2384,7 +2676,26 @@ void eio_free_wb_resources(struct cache_c *dmc)
 		dmc->clean_dbvecs = NULL;
 	}
 
-	dmc->dbvec_count = dmc->mdpage_count = 0;
+	if (dmc->clean_n_sets_dbvecs) {
+		eio_free_wb_bvecs(dmc->clean_n_sets_dbvecs, dmc->dbvec_count_n_sets,
+				  dmc->block_size);
+		kfree(dmc->clean_n_sets_dbvecs);
+		dmc->clean_n_sets_dbvecs = NULL;
+	}
+
+	if (dmc->sort_array) {
+		kfree(dmc->sort_array);
+		dmc->sort_array = NULL;
+	}
+	
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+		if (dmc->set_dirty_sort ) {
+			kfree(dmc->set_dirty_sort);
+			dmc->set_dirty_sort = NULL;
+		}
+#endif
+	dmc->dbvec_count = dmc->mdpage_count = dmc->dbvec_count_n_sets = 0;
+
 	return;
 }
 
@@ -2633,7 +2944,7 @@ sector_t eio_get_device_start_sect(struct eio_bdev *dev)
 module_init(eio_init);
 module_exit(eio_exit);
 
-MODULE_DESCRIPTION(DM_NAME "STEC EnhanceIO target");
-MODULE_AUTHOR("STEC, Inc. based on code by Facebook");
+MODULE_DESCRIPTION(DM_NAME " WSsmartcache target");
+MODULE_AUTHOR("WS, Inc. based on code by Facebook");
 
 MODULE_LICENSE("GPL");

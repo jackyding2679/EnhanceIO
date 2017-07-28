@@ -60,6 +60,7 @@
 #include <linux/vmalloc.h>      /* for sysinfo (mem) variables */
 #include <linux/mm.h>
 #include <scsi/scsi_device.h>   /* required for SSD failure handling */
+#include <linux/sort.h>
 /* resolve conflict with scsi/scsi_device.h */
 #ifdef QUEUED
 #undef QUEUED
@@ -75,6 +76,9 @@
 /* Bit offsets for wait_on_bit_lock() */
 #define EIO_UPDATE_LIST         0
 #define EIO_HANDLE_REBOOT       1
+
+#define CONFIG_SRC_ADD_RESUME
+#define CONFIG_LOW_IO_PRESSURE_CLEAN 
 
 /*
  * It is to carry out 64bit division
@@ -442,6 +446,7 @@ enum dev_notifier {
 	NOTIFY_INITIALIZER,
 	NOTIFY_SSD_ADD,
 	NOTIFY_SSD_REMOVED,
+	NOTIFY_SRC_ADD,
 	NOTIFY_SRC_REMOVED
 };
 
@@ -483,8 +488,10 @@ enum dev_notifier {
  */
 #define DIRTY_HIGH_THRESH_DEF           30
 #define DIRTY_LOW_THRESH_DEF            10
-#define DIRTY_SET_HIGH_THRESH_DEF       100
-#define DIRTY_SET_LOW_THRESH_DEF        30
+//#define DIRTY_SET_HIGH_THRESH_DEF       100
+#define DIRTY_SET_HIGH_THRESH_DEF       90
+//#define DIRTY_SET_LOW_THRESH_DEF        30
+#define DIRTY_SET_LOW_THRESH_DEF        0
 
 #define CLEAN_FACTOR(sectors)           ((sectors) >> 25)       /* in 16 GB multiples */
 #define TIME_BASED_CLEAN_INTERVAL_DEF(dmc)      (uint32_t)(CLEAN_FACTOR((dmc)->cache_size) ? \
@@ -575,7 +582,9 @@ struct mdupdate_request {
 
 #define SETFLAG_CLEAN_INPROG    0x00000001      /* clean in progress on a set */
 #define SETFLAG_CLEAN_WHOLE     0x00000002      /* clean the set fully */
-
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+#define SETFLAG_CLEAN_LOW_IO_PRESSURE     0x00000004      /* clean the set when low io pressure */
+#endif
 /* Structure used for doing operations and storing cache set level info */
 struct cache_set {
 	struct list_head list;
@@ -666,11 +675,21 @@ struct eio_sysctl {
 	uint32_t dirty_low_threshold;
 	uint32_t dirty_set_high_threshold;
 	uint32_t dirty_set_low_threshold;
-	uint32_t time_based_clean_interval;    /* time after which dirty sets should clean */
+	uint32_t time_based_clean_interval;    /* time after which dirty sets should clean */	
+	uint32_t enable_aged_clean;    /* enable or disable aged clean */
 	int32_t autoclean_threshold;
 	int32_t mem_limit_pct;
 	int32_t control;
 	u_int64_t invalidate;
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	uint32_t enable_low_io_pressure_clean;
+	uint32_t low_io_pressure_threshold;/*number of ios per second*/	
+	uint32_t low_io_pressure_latency;/*lantency per IO*/
+	uint32_t low_io_pressure_clean_set_nr;
+	uint32_t low_io_pressure_dirty_threshold;
+#endif
+	uint32_t enable_sort_flush;    /* enable or disable sort flush */
+
 };
 
 /* forward declaration */
@@ -716,8 +735,11 @@ struct cache_c {
 	int clean_thread_running;       /* to indicate that clean thread is running */
 	atomic64_t clean_pendings;      /* Number of sets pending to be cleaned */
 	struct bio_vec *clean_dbvecs;   /* Data bvecs for clean set */
+	struct bio_vec *clean_n_sets_dbvecs;   /* Data bvecs for clean n set */
+	struct dbn_index_pair *sort_array; /*for heap sort*/
 	struct page **clean_mdpages;    /* Metadata pages for clean set */
 	int dbvec_count;
+	int dbvec_count_n_sets;
 	int mdpage_count;
 	int clean_excess_dirty;         /* Clean in progress to bring cache dirty blocks in limits */
 	atomic_t clean_index;           /* set being cleaned, in case of force clean */
@@ -787,6 +809,28 @@ struct cache_c {
 	int is_clean_aged_sets_sched;                   /* to know whether clean aged sets is scheduled */
 	struct workqueue_struct *mdupdate_q;            /* Workqueue to handle md updates */
 	struct workqueue_struct *callback_q;            /* Workqueue to handle io callbacks */
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	struct delayed_work low_pressure_clean_work;   /* work to clean sets when io pressure is low*/
+	struct set_nr_dirty_pair *set_dirty_sort;
+	u_int32_t low_io_pressure_sched_interval;
+	int is_low_pressure_clean_work_sched;
+	atomic_t flag_rm_sets;
+	int64_t last_ioc;
+	u_int64_t last_rwms;
+	u_int32_t lowp_cnt;
+	int scan_head;
+#endif
+#ifdef CONFIG_SRC_ADD_RESUME
+	u_int32_t cached_blocks_tmp;
+#endif
+	/*dbg ctl*/
+	int log_level;
+	/*issues 2253*/
+	spinlock_t bc_free_lock;
+	spinlock_t bc_id_lock;
+	u_int64_t bc_id;
+
+    struct rw_semaphore muti_set_op_protect; 
 };
 
 #define EIO_CACHE_IOSIZE                0
@@ -808,6 +852,8 @@ struct cache_c {
 
 /* Device failure handling.  */
 #define CACHE_SRC_IS_ABSENT(dmc)                (((dmc)->eio_errors.no_source_dev == 1) ? 1 : 0)
+#define CACHE_SSD_IS_ABSENT(dmc)                (((dmc)->eio_errors.no_cache_dev == 1) ? 1 : 0)
+
 
 #define AUTOCLEAN_THRESHOLD_CROSSED(dmc)	\
 	((atomic64_read(&(dmc)->nr_ios) > (int64_t)(dmc)->sysctl_active.autoclean_threshold) ||	\
@@ -866,6 +912,7 @@ enum eio_io_dir {
 /* ASK
  * Container for all eio_bio corresponding to a given bio
  */
+#define BC_MAGIC 0xfeedcace
 struct bio_container {
 	spinlock_t bc_lock;                     /* lock protecting the bc fields */
 	atomic_t bc_holdcount;                  /* number of ebios referencing bc */
@@ -880,6 +927,9 @@ struct bio_container {
 	int bc_error;                           /* error encountered during processing bc */
 	unsigned long bc_iotime;                /* maintains i/o time in jiffies */
 	struct bio_container *bc_next;          /* next bc in the chain */
+	/*fix issues 2253*/
+	atomic64_t bc_id;
+	u_int32_t bc_magic;
 };
 
 /* structure used as callback context during synchronous I/O */
@@ -1151,4 +1201,69 @@ extern sector_t eio_get_device_start_sect(struct eio_bdev *);
 #include "eio_policy.h"
 #define EIO_CACHE(dmc)          (EIO_MD8(dmc) ? (void *)dmc->cache_md8 : (void *)dmc->cache)
 
-#endif                          /* !EIO_INC_H */
+
+/*Heap sort function declare*/
+
+#define EIO_DEBUG_ON	1
+#define DBG_PREFIX "ws-smartcache"
+enum {
+	EIO_LOG_LEVEL_DEBUG = 3,
+	EIO_LOG_LEVEL_INFO = 2, 
+	EIO_LOG_LEVEL_ERROR = 1
+};
+#define EIO_LOG_LEVEL_OFF 0
+
+#if EIO_DEBUG_ON
+#define EIO_DBG(level, dmc, fmt, arg...)	\
+	do {                                         \
+		if ((dmc)->log_level >= EIO_LOG_LEVEL_##level) {      \
+			printk(KERN_ERR DBG_PREFIX":%s:" fmt "\n",(dmc)->cache_name, ##arg); \
+		}     \
+	} while (0)
+#else
+#define EIO_DBG(level, dmc, fmt, arg...) 	 do {} while(0)
+#endif
+
+int cmp_dbn(const void *a, const void *b);
+/*Clean N sets*/
+#define NR_CLEAN_SET 2
+#define NR_CLEAN_SET_SHIFT 1
+
+/*low IO pressure clean macros*/
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+int cmp_dirty_nr(const void *a, const void *b);
+void eio_clean_low_io_pressure(struct work_struct *work);
+
+#define WORK_SCHED_INTERVAL 1
+#define WORK_SCHED_INTERVAL_HIGH 5
+#define TEN_PERCENT_DIRTY_NR 26
+#define SORT_SET_NR 4096
+#define LOW_IO_PRESSURE_SYSCTL_NR 5
+#define LOW_IO_PRESSURE_DIRTY_THRESHOLD 10 /*low io pressure threhold percentage*/
+#define LOW_IO_PRESSURE_CLEAN_SET_NR 32  /*set number to clean*/
+#define ENABLE_LOW_IO_PRESSURE_CLEAN 1  /*read and write io count per second*/
+#define LOW_IO_PRESSURE_THRESHOLD 512 
+#define LOW_IO_LATENCY_THRESHOLD 20 
+#define LOW_IO_PRESSURE_TIMES 3
+//#define HIGH_IO_PRESSURE_TIMES 3
+struct set_nr_dirty_pair {
+	index_t set_index;
+	unsigned int nr_dirty;
+};
+#else
+#define LOW_IO_PRESSURE_SYSCTL_NR 0
+#endif
+
+#define DISABLE_AGED_CLEAN 0
+#define ENABLE_SORT_FLUSH 1
+/*Hotplug source disk*/
+#ifdef CONFIG_SRC_ADD_RESUME
+int eio_ctr_src_add(struct cache_c *dmc, char *dev);
+int eio_handle_src_message(char *cache_name, char *ssd_name,
+				  enum dev_notifier note);
+int eio_activate_src_add(struct cache_c *dmc, struct eio_bdev *prev_dev);
+#endif
+
+#endif                     
+
+/* !EIO_INC_H */

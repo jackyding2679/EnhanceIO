@@ -316,7 +316,10 @@ void eio_suspend_caching(struct cache_c *dmc, enum dev_notifier note)
 		if (CACHE_DEGRADED_IS_SET(dmc))
 			dmc->cache_flags &= ~CACHE_FLAGS_DEGRADED;
 		dmc->cache_flags |= CACHE_FLAGS_FAILED;
-		dmc->eio_errors.no_source_dev = 1;
+		dmc->eio_errors.no_source_dev = 1;		
+	#ifdef  CONFIG_SRC_ADD_RESUME
+		dmc->cached_blocks_tmp = atomic64_read(&dmc->eio_stats.cached_blocks);
+	#endif
 		atomic64_set(&dmc->eio_stats.cached_blocks, 0);
 		pr_info("suspend_caching: Source Device Removed."
 			"Cache \"%s\" is in Failed mode.\n", dmc->cache_name);

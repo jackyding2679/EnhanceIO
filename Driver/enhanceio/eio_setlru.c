@@ -168,3 +168,57 @@ int lru_rem_head(struct lru_ls *llist, index_t *index, u_int64_t *key)
 
 	return 0;
 }
+
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN 
+bool lru_empty(struct lru_ls *llist)
+{
+	return llist->ll_head == LRU_NULL && llist->ll_tail == LRU_NULL;
+}
+/*Scan the lru list*/
+int lru_scan(struct lru_ls *llist, struct set_nr_dirty_pair *array, 
+						int count, int *scanned_count, int scan_head)
+{
+	int i;
+	index_t index;
+	
+	if (!llist || !array || !scanned_count || (0 == count))
+		return -EINVAL;
+
+	if (scan_head) {
+		/*scan head*/
+		if (LRU_NULL == llist->ll_head) {
+			*scanned_count = 0;
+			return 0;
+		} else {
+			index = llist->ll_head;
+			for (i = 0; i < count; i++) {
+				array[i].set_index = index;
+				index = llist->ll_elem[index].le_next;
+				if (LRU_NULL == index) {
+					*scanned_count = i + 1;
+					return 0;
+				}
+			}
+		}
+	} else {
+		/*scan tail*/
+		if (LRU_NULL == llist->ll_tail) {
+			*scanned_count = 0;
+			return 0;
+		} else {
+			index = llist->ll_tail;
+			for (i = 0; i < count; i++) {
+				array[i].set_index = index;
+				index = llist->ll_elem[index].le_prev;
+				if (LRU_NULL == index) {
+					*scanned_count = i + 1;
+					return 0;
+				}
+			}
+		}
+	}
+	*scanned_count = count;
+	
+	return 0;
+}
+#endif

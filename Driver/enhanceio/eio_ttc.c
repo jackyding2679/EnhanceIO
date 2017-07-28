@@ -36,7 +36,7 @@
 #define wait_on_bit_lock_action wait_on_bit_lock
 #endif
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,15,0))
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3,15,0) && LINUX_VERSION_CODE != KERNEL_VERSION(3,10,0))
 #define smp_mb__after_atomic smp_mb__after_clear_bit
 #endif
 
@@ -106,6 +106,7 @@ int eio_ttc_get_device(const char *path, fmode_t mode, struct eio_bdev **result)
 	bdev = blkdev_get_by_path(path, mode, eio_holder);
 	if (IS_ERR(bdev))
 		return PTR_ERR(bdev);
+	
 
 	eio_bdev = kzalloc(sizeof(*eio_bdev), GFP_KERNEL);
 	if (eio_bdev == NULL) {
@@ -147,6 +148,91 @@ struct cache_c *eio_cache_lookup(char *name)
 	}
 	return NULL;
 }
+
+#ifdef CONFIG_SRC_ADD_RESUME
+/*
+ * activate cache when source device add
+ */
+int eio_activate_src_add(struct cache_c *dmc, struct eio_bdev *prev_dev)
+{
+	//struct cache_c *dmc1 = NULL;
+	struct block_device *bdev;	
+	struct block_device *prev_bdev;
+	struct request_queue *rq;
+	int wholedisk = 0;	
+	int index;	
+	int rw_flags = 0;
+
+	bdev = dmc->disk_dev->bdev;
+	if (bdev == NULL || prev_dev == NULL) {
+		pr_err("eio_activate_src_add: bdev or prev_dev NULL\n");
+		return -ENODEV;
+	}
+	
+	prev_bdev = prev_dev->bdev;
+	if (prev_bdev == NULL) {
+		pr_err("eio_activate_src_add: prev_bdev NULL\n");
+		return -ENODEV;
+	}
+	
+	/*delete cache frome cachelist*/
+	index = EIO_HASH_BDEV(prev_bdev->bd_contains->bd_dev);		
+	//pr_err("eio_activate_src_add: index:[%d]\n", index);	
+	//pr_err("eio_activate_src_add: bd_holders before put[%d], bd_opener[%d]\n",
+			//prev_bdev->bd_holders, prev_bdev->bd_openers);
+	down_write(&eio_ttc_lock[index]);
+	list_del(&dmc->cachelist);
+	up_write(&eio_ttc_lock[index]);
+	#if 0
+	/*test*/
+	dmc1 = NULL;
+	dmc1 = eio_cache_lookup(dmc->cache_name);
+	if(dmc1) {		
+		pr_info("eio_activate_src_add: after delete, eio cache lookup succeed\n");
+	} else {
+		pr_info("eio_activate_src_add: after delete, eio cache lookup failed\n");
+	}
+	#endif
+	/*put prev src dev*/		
+	eio_ttc_put_device(&prev_dev);	
+	//pr_err("eio_activate_src_add: bd_holders after put[%d], bd_opener[%d]\n",
+		//prev_bdev->bd_holders, prev_bdev->bd_openers);
+	
+	/*get src dev request queue*/
+	rq = bdev->bd_disk->queue;
+	if (rq == NULL) {
+		pr_err("eio_activate_src_add: rq NULL\n");
+		return -ENODEV;
+	}
+
+	if (bdev == bdev->bd_contains) {
+		wholedisk = 1;
+	}
+
+	/*replace request_fn*/
+	dmc->origmfn = rq->make_request_fn;
+	rq->make_request_fn = eio_make_request_fn;
+	dmc->dev_info =
+		(wholedisk) ? EIO_DEV_WHOLE_DISK : EIO_DEV_PARTITION;
+
+	/*add cache to cachelist*/
+	index = EIO_HASH_BDEV(bdev->bd_contains->bd_dev);	
+	down_write(&eio_ttc_lock[index]);
+	list_add_tail(&dmc->cachelist, &eio_ttc_list[index]);
+	
+	msleep(1);
+	SET_BARRIER_FLAGS(rw_flags);
+	eio_issue_empty_barrier_flush(dmc->disk_dev->bdev, NULL,
+				      EIO_HDD_DEVICE, dmc->origmfn, rw_flags);
+	up_write(&eio_ttc_lock[index]);
+
+	return 0;
+}
+#endif
+
+/*
+ * resume a degraded cache after the SRC is added.
+ */
 
 int eio_ttc_activate(struct cache_c *dmc)
 {
@@ -1181,7 +1267,8 @@ out:
 				("cache_edit: Failed to restart async tasks. error=%d.\n",
 				ret);
 		}
-		if (dmc->sysctl_active.time_based_clean_interval &&
+		if (dmc->sysctl_active.enable_aged_clean &&
+			dmc->sysctl_active.time_based_clean_interval &&
 		    atomic64_read(&dmc->nr_dirty)) {
 			schedule_delayed_work(&dmc->clean_aged_sets_work,
 					      dmc->

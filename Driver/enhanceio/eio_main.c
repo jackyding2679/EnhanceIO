@@ -63,6 +63,8 @@ static void eio_enqueue_readfill(struct cache_c *dmc, struct kcached_job *job);
 static int eio_acquire_set_locks(struct cache_c *dmc, struct bio_container *bc);
 static int eio_release_io_resources(struct cache_c *dmc,
 				    struct bio_container *bc);
+static void 
+eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force);
 static void eio_clean_set(struct cache_c *dmc, index_t set, int whole,
 			  int force);
 static void eio_do_mdupdate(struct work_struct *work);
@@ -75,7 +77,7 @@ static void eio_check_dirty_set_thresholds(struct cache_c *dmc, index_t set);
 static void eio_check_dirty_cache_thresholds(struct cache_c *dmc);
 static void eio_post_mdupdate(struct work_struct *work);
 static void eio_post_io_callback(struct work_struct *work);
-
+static int add_to_cleanq_low_io_pressure(struct cache_c *dmc, int count);
 static void bc_addfb(struct bio_container *bc, struct eio_bio *ebio)
 {
 
@@ -88,7 +90,8 @@ static void bc_put(struct bio_container *bc, unsigned int doneio)
 {
 	struct cache_c *dmc;
 	int data_dir;
-	long elapsed;
+	long elapsed;	
+	unsigned long flags = 0;
 
 	if (atomic_dec_and_test(&bc->bc_holdcount)) {
 		if (bc->bc_dmc->mode == CACHE_MODE_WB)
@@ -111,7 +114,12 @@ static void bc_put(struct bio_container *bc, unsigned int doneio)
 
 		bio_endio(bc->bc_bio, bc->bc_error);
 		atomic64_dec(&bc->bc_dmc->nr_ios);
-		kfree(bc);
+		
+		spin_lock_irqsave(&dmc->bc_free_lock, flags);
+		atomic64_set(&bc->bc_id, 0);
+		bc->bc_magic = 0;
+ 		kfree(bc);	
+		spin_unlock_irqrestore(&dmc->bc_free_lock, flags);
 	}
 }
 
@@ -673,6 +681,10 @@ int eio_clean_thread_proc(void *context)
 	unsigned long flags = 0;
 	u_int64_t systime;
 	index_t index;
+	index_t clean_set_array[NR_CLEAN_SET] = {-1, };
+	int nr_to_clean = 0;
+	int i;
+	
 
 	/* Sync makes sense only for writeback cache */
 	EIO_ASSERT(dmc->mode == CACHE_MODE_WB);
@@ -700,7 +712,8 @@ int eio_clean_thread_proc(void *context)
 			/* resume the periodic clean */
 			spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
 			dmc->is_clean_aged_sets_sched = 0;
-			if (dmc->sysctl_active.time_based_clean_interval
+			if (dmc->sysctl_active.enable_aged_clean
+				&& dmc->sysctl_active.time_based_clean_interval
 			    && atomic64_read(&dmc->nr_dirty)) {
 				/* there is a potential race here, If a sysctl changes
 				   the time_based_clean_interval to 0. However a strong
@@ -745,12 +758,58 @@ int eio_clean_thread_proc(void *context)
 					   list);
 			list_del(&set->list);
 			index = set - dmc->cache_sets;
-			if (!(dmc->sysctl_active.fast_remove)) {
-				eio_clean_set(dmc, index,
-					      set->flags & SETFLAG_CLEAN_WHOLE,
-					      0);
-			} else {
+		#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+			if (atomic_read(&dmc->flag_rm_sets) && !(dmc->sysctl_active.fast_remove)) {
+				if (dmc->cache_sets[index].flags & SETFLAG_CLEAN_LOW_IO_PRESSURE) {					
+					EIO_DBG(INFO, dmc, 
+					"remove set[%lu],SETFLAG_CLEAN_LOW_IO_PRESSUREflag set\n",
+					(unsigned long)index);
+					/*remove set*/					
+					spin_lock_irqsave(&dmc->cache_sets[index].
+							  cs_lock, flags);
+					dmc->cache_sets[index].flags &=
+						~(SETFLAG_CLEAN_INPROG |
+						  SETFLAG_CLEAN_WHOLE |
+						  SETFLAG_CLEAN_LOW_IO_PRESSURE);
+					spin_unlock_irqrestore(&dmc->cache_sets[index].
+								   cs_lock, flags);
+					spin_lock_irqsave(&dmc->dirty_set_lru_lock,
+							  flags);
+					lru_touch(dmc->dirty_set_lru, index, systime);
+					spin_unlock_irqrestore(&dmc->dirty_set_lru_lock,
+							   flags);
+					atomic64_dec(&dmc->clean_pendings);
+					continue;
+				}
+			}
+		#endif
 
+			clean_set_array[nr_to_clean++] = index;
+			
+			if (!(dmc->sysctl_active.fast_remove)) {
+				if (dmc->sysctl_active.enable_sort_flush) {
+					/*sort flush*/
+					if (NR_CLEAN_SET == nr_to_clean || list_empty(&setlist)) {
+						/*eio_clean_set(dmc, index,
+							      set->flags & SETFLAG_CLEAN_WHOLE,
+							      0);*/
+						eio_clean_n_sets(dmc, clean_set_array, nr_to_clean, 0);
+						atomic64_sub(nr_to_clean, &dmc->clean_pendings);
+						nr_to_clean = 0;
+					}
+				} else {
+					/*non-sort flush*/
+					for (i = 0; i < nr_to_clean; i++) {
+						index = clean_set_array[i];
+						eio_clean_set(dmc, index,
+								  set->flags & SETFLAG_CLEAN_WHOLE,
+								  0);
+					}					
+					atomic64_sub(nr_to_clean, &dmc->clean_pendings);
+					nr_to_clean = 0;
+				}
+			} else {
+				#if 0
 				/*
 				 * Since we are not cleaning the set, we should
 				 * put the set back in the lru list so that
@@ -771,8 +830,31 @@ int eio_clean_thread_proc(void *context)
 				lru_touch(dmc->dirty_set_lru, index, systime);
 				spin_unlock_irqrestore(&dmc->dirty_set_lru_lock,
 						       flags);
+				#endif
+				
+				do {
+					index = clean_set_array[--nr_to_clean];
+					spin_lock_irqsave(&dmc->cache_sets[index].
+							  cs_lock, flags);
+					dmc->cache_sets[index].flags &=
+						~(SETFLAG_CLEAN_INPROG |
+						  SETFLAG_CLEAN_WHOLE
+						#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+							| SETFLAG_CLEAN_LOW_IO_PRESSURE  
+						#endif
+						);
+					spin_unlock_irqrestore(&dmc->cache_sets[index].
+								   cs_lock, flags);
+					spin_lock_irqsave(&dmc->dirty_set_lru_lock,
+							  flags);
+					lru_touch(dmc->dirty_set_lru, index, systime);
+					spin_unlock_irqrestore(&dmc->dirty_set_lru_lock,
+							   flags);
+				} while(nr_to_clean > 0);	
+				atomic64_sub(nr_to_clean, &dmc->clean_pendings);
+				nr_to_clean = 0;
 			}
-			atomic64_dec(&dmc->clean_pendings);
+			//atomic64_dec(&dmc->clean_pendings);
 		}
 	}
 
@@ -1475,7 +1557,10 @@ static void eio_enq_mdupdate(struct bio_container *bc)
 	struct cache_set *set = NULL;
 	struct mdupdate_request *mdreq;
 	int do_schedule;
-
+	unsigned long bc_id1, bc_id2;
+	u_int32_t bc_magic;
+ 
+	bc_id1 = atomic64_read(&bc->bc_id);
 	ebio = bc->bc_mdlist;
 	set_index = -1;
 	do_schedule = 0;
@@ -1519,7 +1604,22 @@ static void eio_enq_mdupdate(struct bio_container *bc)
 		}
 	}
 
-	EIO_ASSERT(bc->bc_mdlist == NULL);
+	spin_lock_irqsave(&dmc->bc_free_lock, flags);
+ 	bc_id2 = atomic64_read(&bc->bc_id);
+	bc_magic = bc->bc_magic;
+	if ((bc_id2 == bc_id1) && (BC_MAGIC == bc_magic)) {
+		EIO_ASSERT(bc->bc_mdlist == NULL);
+		spin_unlock_irqrestore(&dmc->bc_free_lock, flags);
+	} else {
+		spin_unlock_irqrestore(&dmc->bc_free_lock, flags);
+ 		printk(KERN_ERR "%s:bc_id1:%lu, bc_id2:%lu, bc_maigc:%x\n", 
+				dmc->cache_name, bc_id1, bc_id2, bc_magic);
+		if (0 == bc_id2 && 0 == bc_magic) {
+			printk(KERN_ERR "%s:bio_container has been freed!!!\n", dmc->cache_name);
+		} else {
+			printk(KERN_ERR "%s:bio_container unexpected changed!!!\n", dmc->cache_name);			
+		}
+	}	
 }
 
 /* Kick-off a cache metadata update for marking the blocks dirty */
@@ -1596,6 +1696,7 @@ static void eio_check_dirty_cache_thresholds(struct cache_c *dmc)
 
 			enqueued_cleans += dmc->cache_sets[set_index].nr_dirty;
 			spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+			EIO_DBG(INFO, dmc, "++++++add set[0x%lx] to clean:dirty threshold crossed", set_index);
 			eio_addto_cleanq(dmc, set_index, 1);
 			spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
 		} while (enqueued_cleans <= required_cleans);
@@ -1609,8 +1710,10 @@ static void eio_check_dirty_cache_thresholds(struct cache_c *dmc)
 /* Ensure set level dirty thresholds compliance. If required, trigger set clean */
 static void eio_check_dirty_set_thresholds(struct cache_c *dmc, index_t set)
 {
-	if (DIRTY_SET_THRESHOLD_CROSSED(dmc, set)) {
-		eio_addto_cleanq(dmc, set, 0);
+	if (DIRTY_SET_THRESHOLD_CROSSED(dmc, set)) {		
+		EIO_DBG(INFO, dmc, "++++++add set[0x%lx] to clean:dirty block threshold crossed[whole=1], nr_dirty:%u",\
+				set, dmc->cache_sets[set].nr_dirty);
+		eio_addto_cleanq(dmc, set, 1);
 		return;
 	}
 }
@@ -2376,9 +2479,11 @@ static int eio_acquire_set_locks(struct cache_c *dmc, struct bio_container *bc)
 	}
 
 	/* Acquire read locks on the sets in the set span */
+	down_write(&dmc->muti_set_op_protect);
 	for (cur_seq = bc->bc_setspan; cur_seq; cur_seq = cur_seq->next)
 		for (i = cur_seq->first_set; i <= cur_seq->last_set; i++)
 			down_read(&dmc->cache_sets[i].rw_lock);
+	up_write(&dmc->muti_set_op_protect);
 
 	return 0;
 
@@ -2537,6 +2642,7 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 	struct eio_bio *ebegin = NULL;
 	struct eio_bio *eend = NULL;
 	struct eio_bio *enext = NULL;
+	unsigned long flags = 0;
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	EIO_ASSERT(bio->bi_iter.bi_idx == 0);
@@ -2642,6 +2748,12 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 		bio_endio(bio, -ENOMEM);
 		return DM_MAPIO_SUBMITTED;
 	}
+	/*fix issues 2253*/
+	spin_lock_irqsave(&dmc->bc_id_lock, flags);
+	atomic64_set(&bc->bc_id, dmc->bc_id);
+	dmc->bc_id++;
+	spin_unlock_irqrestore(&dmc->bc_id_lock, flags);
+	bc->bc_magic = BC_MAGIC;
 	bc->bc_iotime = jiffies;
 	bc->bc_bio = bio;
 	bc->bc_dmc = dmc;
@@ -2744,6 +2856,8 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 		/* read io processing */
 		eio_read(dmc, bc, ebegin);
 	} else
+        
+	    
 		/* write io processing */
 		eio_write(dmc, bc, ebegin);
 
@@ -3279,6 +3393,409 @@ struct bio_vec *setup_bio_vecs(struct bio_vec *bvec, index_t block_index,
 	return data;
 }
 
+static void 
+//eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int whole, int force)
+eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force)
+
+{
+	struct eio_io_region where;
+	int error;
+	index_t i;
+	index_t j;
+	index_t start_index;
+	index_t end_index;
+	struct sync_io_context sioc;
+	int ncleans = 0;
+	int alloc_size;
+	struct flash_cacheblock *md_blocks = NULL;
+	unsigned long flags;
+
+	int pindex, k;
+	index_t blkindex;
+	struct bio_vec *bvecs;
+	unsigned nr_bvecs = 0, total;
+	void *pg_virt_addr[2] = { NULL };
+
+	int bindex, tmp;
+	index_t set;
+	int ttl_cleans = 0;	
+	int nr_sort = 0;
+	int ttl_nr_dirty = 0;	
+	
+	unsigned long start_read;	
+	unsigned long read_completed;
+	unsigned long start_sort;	
+	unsigned long end_sort;
+	unsigned long start_flush;	
+	unsigned long end_flush;
+	unsigned long io_completed;
+	unsigned long start_write_md;	
+	unsigned long end_write_md;
+
+	/* Cache is failed mode, do nothing. */
+	if (unlikely(CACHE_FAILED_IS_SET(dmc))) {
+		pr_debug("clean_set: CACHE \"%s\" is in FAILED state.",
+			 dmc->cache_name);
+		EIO_DBG(ERROR, dmc, "CACHE \"%s\" is in FAILED state.",
+			 dmc->cache_name);
+		goto err_out1;
+	}
+
+	/* If this is not the suitable time to clean, postpone it */
+	if ((!force) && AUTOCLEAN_THRESHOLD_CROSSED(dmc)) {
+		goto err_out1;
+	}
+
+	/*
+	 * 1. Take exclusive lock on all cache sets
+	 * 2. Verify that there are dirty blocks to clean
+	 * 3. Identify the cache blocks to clean
+	 * 4. add CLEAN_INPROG cache block to sort_array
+	 * 5. Read the cache blocks data from ssd
+	 * 6. HeapSort	 
+	 * 7. write to hdd
+	 * 8. update on-disk cache metadata
+	 */
+
+    down_write(&dmc->muti_set_op_protect);
+	for (k = 0; k < nr_set; k++) {		
+		set = set_array[k];
+
+		/* 1. exclusive lock. Let the ongoing writes to finish. Pause new writes */
+		down_write(&dmc->cache_sets[set].rw_lock);
+
+		/* 2. Verify that there are dirty blocks to clean */
+		//EIO_ASSERT(dmc->cache_sets[set].nr_dirty != 0);
+		if (0 == dmc->cache_sets[set].nr_dirty) {
+			EIO_DBG(DEBUG, dmc, "------CACHESET[0x%lx] no dirty block------\n", set);
+		}
+		ttl_nr_dirty += dmc->cache_sets[set].nr_dirty;
+	}
+	up_write(&dmc->muti_set_op_protect);
+	if (0 == ttl_nr_dirty) {
+		//pr_err("------no dirty block------\n");
+		goto err_out2;
+	}
+
+	start_read = jiffies;
+	EIO_DBG(DEBUG, dmc, "------START READ:%ums------\n", jiffies_to_msecs(start_read));
+	for (k = 0; k < nr_set; k++) {
+		set = set_array[k];
+		start_index = set * dmc->assoc;
+		end_index = start_index + dmc->assoc;
+		
+		/* 3. identify and mark cache blocks to clean */
+		if (!(dmc->cache_sets[set].flags & SETFLAG_CLEAN_WHOLE))
+			eio_get_setblks_to_clean(dmc, set, &ncleans);
+		else {
+			for (i = start_index; i < end_index; i++) {
+				if (EIO_CACHE_STATE_GET(dmc, i) == ALREADY_DIRTY) {
+					EIO_CACHE_STATE_SET(dmc, i, CLEAN_INPROG);
+					ncleans++;				
+				}
+			}
+		}
+		//EIO_ASSERT(ncleans != 0);
+		ttl_cleans += ncleans;
+		
+		EIO_DBG(DEBUG, dmc, "------CLEAN set[0x%lx], ncleans[0x%x]------", set, ncleans);
+		ncleans = 0;
+		/*4. add CLEAN_INPROG cache block to sort_array*/
+		for (i = start_index; i < end_index; i++) {
+			if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG) {
+				dmc->sort_array[nr_sort].dbn = EIO_DBN_GET(dmc, i);
+				dmc->sort_array[nr_sort].index = (i - start_index) + dmc->assoc * k;
+				nr_sort++;
+			}
+		}
+		
+		/* 5. read cache set data */
+		init_rwsem(&sioc.sio_lock);
+		sioc.sio_error = 0;
+
+		for (i = start_index; i < end_index; i++) {
+			if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG) {
+				
+				for (j = i; ((j < end_index) &&
+					(EIO_CACHE_STATE_GET(dmc, j) == CLEAN_INPROG));
+					j++);
+		
+				blkindex = (i - start_index);
+				blkindex += (dmc->assoc * k);
+				total = (j - i);
+				
+				/*
+				 * Get the correct index and number of bvecs
+				 * setup from dmc->clean_n_sets_dbvecs before issuing i/o.
+				 */
+				bvecs =
+					setup_bio_vecs(dmc->clean_n_sets_dbvecs, blkindex,
+							   dmc->block_size, total, &nr_bvecs);
+				EIO_ASSERT(bvecs != NULL);
+				EIO_ASSERT(nr_bvecs > 0);
+		
+				where.bdev = dmc->cache_dev->bdev;
+				where.sector =
+					(i << dmc->block_shift) + dmc->md_sectors;
+				where.count = total * dmc->block_size;
+		
+				SECTOR_STATS(dmc->eio_stats.ssd_reads,
+						 to_bytes(where.count));
+				down_read(&sioc.sio_lock);
+				error =
+					eio_io_async_bvec(dmc, &where, READ, bvecs,
+							  nr_bvecs, eio_sync_io_callback,
+							  &sioc, 0);
+				if (error) {
+					sioc.sio_error = error;
+					up_read(&sioc.sio_lock);
+				}
+		
+				bvecs = NULL;
+				i = j;
+			}
+		}
+		/*
+		 * In above for loop, submit all READ I/Os to SSD
+		 * and unplug the device for immediate submission to
+		 * underlying device driver.
+		 */
+		eio_unplug_cache_device(dmc);
+		
+		//end_read = jiffies;
+		//EIO_DBG("------END READ:%dms------\n", end_read);
+		/* wait for all I/Os to complete and release sync lock */
+		down_write(&sioc.sio_lock);
+		up_write(&sioc.sio_lock);
+				
+		error = sioc.sio_error;
+		if (error)
+			goto err_out3;
+	}
+
+	read_completed = jiffies;
+	EIO_DBG(DEBUG, dmc, "------READ COMPLETED:%ums, READ TIME:%ums------\n", \
+		jiffies_to_msecs(read_completed),\
+		jiffies_to_msecs(read_completed - start_read));
+
+	EIO_DBG(DEBUG, dmc, "------BEFORE SORT------, nr_sort:%d\n", nr_sort);
+	#if 0
+	for (k = 0; k < nr_sort/8; k++) {
+		EIO_DBG("------sort_idx:%d, block_idx:%ld, dbn:%lx------\n", k, 
+			dmc->sort_array[k].index, dmc->sort_array[k].dbn);
+	}
+	#endif
+	/* 6. HeapSort */
+	EIO_ASSERT(ttl_cleans == nr_sort);
+	//heap_sort(dmc->sort_array, nr_sort);
+	start_sort = jiffies;
+	EIO_DBG(DEBUG, dmc, "------START SORT:%ums------\n", jiffies_to_msecs(start_sort));
+	sort(dmc->sort_array, nr_sort, sizeof(dmc->sort_array[0]), cmp_dbn, NULL);
+	end_sort = jiffies;
+	EIO_DBG(DEBUG, dmc, "------END SORT:%ums, SORT TIME:%ums------\n", \
+		jiffies_to_msecs(end_sort), \
+		jiffies_to_msecs(end_sort - start_sort));
+
+	EIO_DBG(DEBUG, dmc, "------AFTER SORT------\n");
+	#if 0
+	for (k = 0; k < nr_sort; k++) {
+		EIO_DBG("------sort_idx:%d, block_idx:%ld, dbn:%lx------\n", k, 
+			dmc->sort_array[k].index, dmc->sort_array[k].dbn);
+	}
+	#endif
+	/* 7. write to hdd */
+	/*
+	 * While writing the data to HDD, explicitly enable
+	 * BIO_RW_SYNC flag to hint higher priority for these
+	 * I/Os.
+	 */
+	start_flush = jiffies;
+	EIO_DBG(INFO, dmc, "------START FLUSH:%ums-----\n", jiffies_to_msecs(start_flush));
+	for (k = 0; k < nr_sort; k++) {	
+		blkindex = dmc->sort_array[k].index;				
+		total = 1;
+		bvecs =
+			setup_bio_vecs(dmc->clean_n_sets_dbvecs, blkindex,
+				       dmc->block_size, total, &nr_bvecs);
+		EIO_ASSERT(bvecs != NULL);
+		EIO_ASSERT(nr_bvecs > 0);
+
+		where.bdev = dmc->disk_dev->bdev;
+		where.sector = dmc->sort_array[k].dbn;
+		where.count = dmc->block_size;
+		//EIO_DBG("write hdd-blkindex:%lx, dbn:%lx\n", blkindex, dmc->sort_array[k].dbn);
+		SECTOR_STATS(dmc->eio_stats.disk_writes,
+			     to_bytes(where.count));
+		down_read(&sioc.sio_lock);
+		error = eio_io_async_bvec(dmc, &where, WRITE | REQ_SYNC,
+					  bvecs, nr_bvecs,
+					  eio_sync_io_callback, &sioc,
+					  1);
+		if (error) {
+			sioc.sio_error = error;
+			up_read(&sioc.sio_lock);
+			EIO_DBG(ERROR, dmc, "CACHEBLOCK:%u write to hdd error!!!\n", (unsigned int)blkindex);
+		}
+		bvecs = NULL;
+		/*test*/
+		//msleep(10);
+	}
+	/* wait for all I/Os to complete and release sync lock */	
+	end_flush = jiffies;
+	EIO_DBG(INFO, dmc, "------SUBMIT ALL IO:%ums-----\n", jiffies_to_msecs(end_flush));
+
+    //error = sync_blockdev(dmc->disk_dev->bdev);
+	//if (error) {
+	//	pr_err("sync error!!!\n");
+	//}
+
+	down_write(&sioc.sio_lock);
+	up_write(&sioc.sio_lock);
+	
+	io_completed = jiffies;
+	EIO_DBG(INFO, dmc, "------ALL IO COMPLETED:%ums-----\n", jiffies_to_msecs(io_completed));	
+	EIO_DBG(INFO, dmc, "------IO COUNT:%u, FLUSH TIME:%ums, SUBMIT TIME:%ums, WAIT TIME:%ums-----\n", \
+		nr_sort, jiffies_to_msecs(io_completed - start_flush), \
+		jiffies_to_msecs(end_flush - start_flush), \
+		jiffies_to_msecs(io_completed - end_flush));
+	error = sioc.sio_error;
+	if (error) {
+		EIO_DBG(ERROR, dmc, "FLUSH error!!!\n");
+		goto err_out3;
+	}
+
+	/* 8. update on-disk cache metadata */
+
+	/* TBD. Do we have to consider sector alignment here ? */
+
+	/*
+	 * md_size = dmc->assoc * sizeof(struct flash_cacheblock);
+	 * Currently, md_size is 8192 bytes, mdpage_count is 2 pages maximum.
+	 */
+
+	EIO_ASSERT(dmc->mdpage_count <= 2);
+
+	start_write_md = jiffies;
+	EIO_DBG(DEBUG, dmc, "------START WRITE MD:%ums------\n", jiffies_to_msecs(start_write_md));
+#if 1
+	alloc_size = dmc->assoc * sizeof(struct flash_cacheblock);
+	
+	for (k = 0; k < nr_set; k++) {
+		set = set_array[k];
+		start_index = set * dmc->assoc;
+		end_index = start_index + dmc->assoc;
+		
+		for (tmp = 0; tmp < dmc->mdpage_count; tmp++) {
+			pg_virt_addr[tmp] = kmap(dmc->clean_mdpages[tmp]);
+		}
+		pindex = 0;
+		md_blocks = (struct flash_cacheblock *)pg_virt_addr[pindex];
+		bindex = MD_BLOCKS_PER_PAGE;
+		
+		for (i = start_index; i < end_index; i++) {
+
+			md_blocks->dbn = cpu_to_le64(EIO_DBN_GET(dmc, i));
+
+			if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG)
+				md_blocks->cache_state = cpu_to_le64(INVALID);
+			else if (EIO_CACHE_STATE_GET(dmc, i) == ALREADY_DIRTY)
+				md_blocks->cache_state = cpu_to_le64((VALID | DIRTY));
+			else
+				md_blocks->cache_state = cpu_to_le64(INVALID);
+
+			/* This was missing earlier. */
+			md_blocks++;
+			bindex--;
+
+			if (bindex == 0) {
+				md_blocks =
+					(struct flash_cacheblock *)pg_virt_addr[++pindex];
+				bindex = MD_BLOCKS_PER_PAGE;
+			}
+		}
+		
+		for (tmp = 0; tmp < dmc->mdpage_count; tmp++) {
+			kunmap(dmc->clean_mdpages[tmp]);
+		}
+		
+		where.bdev = dmc->cache_dev->bdev;
+		where.sector = dmc->md_start_sect + INDEX_TO_MD_SECTOR(start_index);
+		where.count = eio_to_sector(alloc_size);
+		error =
+			eio_io_sync_pages(dmc, &where, WRITE, dmc->clean_mdpages,
+					  dmc->mdpage_count);
+
+		if (error) {
+			for (tmp = 0; tmp < dmc->mdpage_count; tmp++)
+				kunmap(dmc->clean_mdpages[tmp]);
+			
+			goto err_out3;
+		}
+	}
+	end_write_md = jiffies;
+	EIO_DBG(DEBUG, dmc, "------END WRITE MD:%ums, WRITE TIME:%ums------\n", \
+		jiffies_to_msecs(end_write_md), \
+		jiffies_to_msecs(end_write_md - start_write_md));
+#endif
+
+	err_out3:
+	
+		/*
+		 * 7. update in-core cache metadata for clean_inprog blocks.
+		 * If there was an error, set them back to ALREADY_DIRTY
+		 * If no error, set them to VALID
+		 */
+		 
+		for (k = 0; k < nr_set; k++) {
+			set = set_array[k];
+			start_index = set * dmc->assoc;
+			end_index = start_index + dmc->assoc;
+			for (i = start_index; i < end_index; i++) {
+				if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG) {
+					if (error)
+						EIO_CACHE_STATE_SET(dmc, i, ALREADY_DIRTY);
+					else {
+						EIO_CACHE_STATE_SET(dmc, i, VALID);
+						EIO_ASSERT(dmc->cache_sets[set].nr_dirty > 0);
+						dmc->cache_sets[set].nr_dirty--;
+						atomic64_dec(&dmc->nr_dirty);
+					}
+				}
+			}
+		}
+	
+	err_out2:
+		for (k = 0; k < nr_set; k++) {
+			set = set_array[k];
+			up_write(&dmc->cache_sets[set].rw_lock);
+		}
+
+	err_out1:
+		/* Reset clean flags on the set */
+		for (k = 0; k < nr_set; k++) {
+			set = set_array[k];
+			if (!force) {
+				spin_lock_irqsave(&dmc->cache_sets[set].cs_lock, flags);
+				dmc->cache_sets[set].flags &=
+					~(SETFLAG_CLEAN_INPROG | SETFLAG_CLEAN_WHOLE
+					#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+						| SETFLAG_CLEAN_LOW_IO_PRESSURE  
+					#endif
+					);
+				spin_unlock_irqrestore(&dmc->cache_sets[set].cs_lock, flags);
+			}
+
+			if (dmc->cache_sets[set].nr_dirty) {
+				/*
+				 * Lru touch the set, so that it can be picked
+				 * up for whole set clean by clean thread later
+				 */
+				eio_touch_set_lru(dmc, set);
+			}
+		}
+		
+	return;
+}
 /* Cleans a given cache set */
 static void
 eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
@@ -3550,7 +4067,11 @@ err_out1:
 	if (!force) {
 		spin_lock_irqsave(&dmc->cache_sets[set].cs_lock, flags);
 		dmc->cache_sets[set].flags &=
-			~(SETFLAG_CLEAN_INPROG | SETFLAG_CLEAN_WHOLE);
+			~(SETFLAG_CLEAN_INPROG | SETFLAG_CLEAN_WHOLE
+		#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+				| SETFLAG_CLEAN_LOW_IO_PRESSURE  
+		#endif
+		);
 		spin_unlock_irqrestore(&dmc->cache_sets[set].cs_lock, flags);
 	}
 
@@ -3606,7 +4127,8 @@ void eio_clean_aged_sets(struct work_struct *work)
 
 		if ((EIO_DIV((cur_time - set_time), HZ)) <
 		    (dmc->sysctl_active.time_based_clean_interval * 60))
-			break;
+			break;		
+		EIO_DBG(INFO, dmc, "++++++add set[0x%lx] to clean:aged", set_index);		
 		lru_rem(dmc->dirty_set_lru, set_index);
 
 		if (dmc->cache_sets[set_index].nr_dirty > 0) {
@@ -3629,6 +4151,234 @@ out:
 	return;
 }
 
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+static int 
+add_to_cleanq_low_io_pressure(struct cache_c *dmc, int count)
+{
+	int i;	
+	unsigned long flags = 0;	
+	index_t set_index;	
+	
+	if (!dmc->set_dirty_sort || 0 == count) {		
+		EIO_DBG(INFO, dmc, "set_dirty_sort null or count is 0\n");
+		return -1;
+	}
+
+	i = 0;
+	do {
+		#if 0
+		/*test dirty percent*/
+		if (dmc->set_dirty_sort[i].nr_dirty < per_to_nr) {			
+			EIO_DBG(INFO, dmc, "dirty percent is under 10,quit\n");
+			break;
+		}
+		#endif
+		set_index = dmc->set_dirty_sort[i].set_index;
+		/*set flag*/
+		spin_lock_irqsave(&dmc->cache_sets[set_index].cs_lock, flags);
+		dmc->cache_sets[set_index].flags |= SETFLAG_CLEAN_LOW_IO_PRESSURE;
+		spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, flags);
+		EIO_DBG(INFO, dmc, "++++++add set[%lu] to clean:low IO pressure", 
+				(unsigned long)set_index);
+		
+		spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
+		lru_rem(dmc->dirty_set_lru, set_index);		
+		spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+		if (dmc->cache_sets[set_index].nr_dirty > 0) {
+			eio_addto_cleanq(dmc, set_index, 1);
+		}
+	} while (++i < count);
+
+	return 0;
+}
+void eio_clean_low_io_pressure(struct work_struct *work)
+{
+	struct cache_c *dmc;
+	unsigned long flags = 0;
+	index_t set_index;	
+	unsigned int dirty_blk_pct;
+	u_int64_t curr_ioc = 0;
+	u_int64_t diff_ioc;	
+	u_int64_t curr_rwms = 0;
+	u_int64_t diff_rwms;
+	int scanned_count;
+	//int per_to_nr;
+	int ret;	
+	int tmp;
+	int i;
+
+	dmc = container_of(work, struct cache_c, low_pressure_clean_work.work);	
+	/*
+	 * In FAILED state, dont schedule cleaning of sets.
+	 */
+	if (unlikely(CACHE_FAILED_IS_SET(dmc))) {
+		pr_debug("eio_clean_low_io_pressure: Cache \"%s\" is in failed mode.\n",
+			 dmc->cache_name);
+		dmc->is_low_pressure_clean_work_sched = 0;
+		return;
+	}
+	
+	/*test some conditions*/
+	if (unlikely(dmc->sysctl_active.fast_remove 
+		|| dmc->sysctl_active.do_clean 
+		|| (atomic64_read(&dmc->nr_dirty) == 0)
+		|| (dmc->cache_flags & CACHE_FLAGS_SHUTDOWN_INPROG))) {
+		
+		//dmc->is_low_pressure_clean_work_sched = 0;
+		//return;
+		goto out;
+	}
+	
+	/*test dirty_set_lru*/
+	spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
+	if (lru_empty(dmc->dirty_set_lru)) {
+		spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+		EIO_DBG(INFO, dmc, "dirty_set_lru is empty, skip....\n");		
+		goto out;
+	}
+	spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+	
+	/*test threshold*/
+	dirty_blk_pct = EIO_CALCULATE_PERCENTAGE(atomic64_read(&dmc->nr_dirty), 
+												dmc->size);
+	EIO_DBG(INFO, dmc, "dirty_blk_pct is %d\n", dirty_blk_pct);
+	if (dirty_blk_pct < dmc->sysctl_active.low_io_pressure_dirty_threshold) {
+		EIO_DBG(INFO, dmc, "dirty_blk_pct is under %d, skip....\n", 
+			     dmc->sysctl_active.low_io_pressure_dirty_threshold);
+		goto out;
+	}
+
+    if (-1 == dmc->last_ioc) {
+		EIO_DBG(INFO, dmc, "last_ioc is -1\n");
+		dmc->last_ioc = atomic64_read(&dmc->eio_stats.writecount) + \
+			       atomic64_read(&dmc->eio_stats.readcount);
+		dmc->last_rwms =  atomic64_read(&dmc->eio_stats.wrtime_ms) + \
+			       atomic64_read(&dmc->eio_stats.rdtime_ms);
+		goto out;
+    }
+	
+	curr_ioc = atomic64_read(&dmc->eio_stats.writecount) + \
+			       atomic64_read(&dmc->eio_stats.readcount);
+	curr_rwms =  atomic64_read(&dmc->eio_stats.wrtime_ms) + \
+			   atomic64_read(&dmc->eio_stats.rdtime_ms);
+	EIO_DBG(INFO, dmc, "curr_ioc:%lu, last_ioc:%lu, curr_rwms:%lu, last_rwms:%lu\n", 
+				(unsigned long)curr_ioc, (unsigned long)dmc->last_ioc, 
+				(unsigned long)curr_rwms, (unsigned long)dmc->last_rwms);
+
+	/*if sched_interval is 5 second, skip this time*/
+	if (WORK_SCHED_INTERVAL_HIGH == dmc->low_io_pressure_sched_interval) {		
+		EIO_DBG(INFO, dmc, "sched_interval is %d, skip check\n", WORK_SCHED_INTERVAL_HIGH);		
+		dmc->low_io_pressure_sched_interval = WORK_SCHED_INTERVAL;
+		goto out;
+	}
+
+	/*caculate diff_ioc and diff_rwms*/
+	diff_ioc = curr_ioc - dmc->last_ioc;
+	diff_rwms = curr_rwms - dmc->last_rwms;
+	if (diff_ioc > 0) {
+		do_div(diff_rwms, diff_ioc);/*calc lantency per IO*/
+	}
+	do_div(diff_ioc, dmc->low_io_pressure_sched_interval);/*calc IO count per second*/
+
+	if (0 == diff_ioc ||
+		(diff_ioc < dmc->sysctl_active.low_io_pressure_threshold &&
+		diff_rwms < dmc->sysctl_active.low_io_pressure_latency)) {
+		EIO_DBG(INFO, dmc, "diff_ioc:%lu, diff_rwms:%lu, IO pressure is low!\n",
+		(unsigned long)diff_ioc, (unsigned long)diff_rwms);		
+		dmc->low_io_pressure_sched_interval = WORK_SCHED_INTERVAL;
+		dmc->lowp_cnt++;
+		if (dmc->lowp_cnt < LOW_IO_PRESSURE_TIMES) {
+			goto out;
+		} else {
+			atomic_set(&dmc->flag_rm_sets, 0);
+			EIO_DBG(INFO, dmc, "low IO pressure confirm.\n");
+		}
+	} else {
+		EIO_DBG(INFO, dmc, "diff_ioc is %lu, diff_rwms:%lu, IO pressure is high!\n", 
+			(unsigned long)diff_ioc, (unsigned long)diff_rwms);
+		dmc->lowp_cnt = 0;
+		dmc->low_io_pressure_sched_interval = WORK_SCHED_INTERVAL_HIGH;
+		atomic_set(&dmc->flag_rm_sets, 1);
+		goto out;
+	}
+
+	/*if cleanq not empty ,just return*/
+	spin_lock_irqsave(&dmc->clean_sl, flags);
+	if (!list_empty(&dmc->cleanq)) {
+		spin_unlock_irqrestore(&dmc->clean_sl, flags);
+		EIO_DBG(DEBUG, dmc, "list cleanq not empty,return\n");		
+		goto out;
+	}
+	spin_unlock_irqrestore(&dmc->clean_sl, flags);
+
+	EIO_DBG(INFO, dmc, "%s\n", dmc->scan_head ? "scan_head" : "scan_tail");
+	/*scan dirty lru list, get SORT_SET_NR sets */ 
+	spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
+	ret = lru_scan(dmc->dirty_set_lru, dmc->set_dirty_sort, 
+					SORT_SET_NR, &scanned_count, dmc->scan_head);	
+	spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+
+	if (unlikely(ret || (0 == scanned_count))) {
+		pr_info("%s:lru_scan failed!!!, ret:%d, scanned_count:%d, nr_dirty:%lu\n", 
+				dmc->cache_name, ret, scanned_count,
+				(unsigned long)atomic64_read(&dmc->nr_dirty));
+		goto out;
+	}
+
+	/*get dirty_nr for all sets*/	
+	for (i = 0; i < scanned_count; i++) {
+		set_index = dmc->set_dirty_sort[i].set_index;		
+		dmc->set_dirty_sort[i].nr_dirty = 
+				dmc->cache_sets[set_index].nr_dirty;
+		if (unlikely(0 == dmc->cache_sets[set_index].nr_dirty)) {
+			EIO_DBG(INFO, dmc, "set[%lu] nr_dirty is 0\n", (unsigned long)set_index);
+		}
+	}
+	
+	/*sort all the sets by dirty_nr*/
+	sort(dmc->set_dirty_sort, scanned_count, 
+			sizeof(dmc->set_dirty_sort[0]), cmp_dirty_nr, NULL);
+	
+	EIO_DBG(INFO, dmc, "AFTER SORT, scanned_count[%u]\n", scanned_count);
+	tmp = (scanned_count > dmc->sysctl_active.low_io_pressure_clean_set_nr) ? 
+				dmc->sysctl_active.low_io_pressure_clean_set_nr : scanned_count;
+	for (i = 0; i < tmp; i++) {
+		EIO_DBG(INFO, dmc, "set[%lu], dirty:[%u]\n", 
+				(unsigned long)dmc->set_dirty_sort[i].set_index,\
+				dmc->set_dirty_sort[i].nr_dirty);
+	}
+	#if 0
+	per_to_nr = dmc->assoc * dmc->sysctl_active.low_io_pressure_dirty_threshold;
+	do_div(per_to_nr, 100);
+	/*test the 1st dirty percent, if < 10%, try lru_scan_tail*/
+	if (dmc->set_dirty_sort[0].nr_dirty < per_to_nr) {
+		dmc->scan_head = (dmc->scan_head) ? (int)0 : (int)1;
+		EIO_DBG(INFO, dmc,   
+			"the 1st dirty percent < 10%%, switch lru_scan, scan_head:%d\n",
+				dmc->scan_head);
+		goto out;
+	}
+	#endif
+
+	/*insert scaned_count sets to cleanq*/
+	scanned_count = (scanned_count < dmc->sysctl_active.low_io_pressure_clean_set_nr) ? 
+					scanned_count : dmc->sysctl_active.low_io_pressure_clean_set_nr;
+
+	add_to_cleanq_low_io_pressure(dmc, scanned_count);
+
+out:
+	if (curr_ioc) {		
+		dmc->last_ioc = curr_ioc;
+		dmc->last_rwms= curr_rwms;
+	}
+	schedule_delayed_work(&dmc->low_pressure_clean_work, \
+					dmc->low_io_pressure_sched_interval * HZ);
+	
+	return;
+}
+#endif
+
+
 /* Move the given set at the head of the set LRU list */
 void eio_touch_set_lru(struct cache_c *dmc, index_t set)
 {
@@ -3638,14 +4388,43 @@ void eio_touch_set_lru(struct cache_c *dmc, index_t set)
 	systime = jiffies;
 	spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
 	lru_touch(dmc->dirty_set_lru, set, systime);
-
-	if ((dmc->sysctl_active.time_based_clean_interval > 0) &&
+	
+	if (dmc->sysctl_active.enable_aged_clean &&
+		(dmc->sysctl_active.time_based_clean_interval > 0) &&
 	    (dmc->is_clean_aged_sets_sched == 0)) {
 		schedule_delayed_work(&dmc->clean_aged_sets_work,
 				      dmc->sysctl_active.
 				      time_based_clean_interval * 60 * HZ);
 		dmc->is_clean_aged_sets_sched = 1;
 	}
-
 	spin_unlock_irqrestore(&dmc->dirty_set_lru_lock, flags);
+	
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+	if (dmc->sysctl_active.enable_low_io_pressure_clean) {
+		/*sched low io presssure clean work*/
+		if (0 == dmc->is_low_pressure_clean_work_sched) {
+			schedule_delayed_work(&dmc->low_pressure_clean_work, \
+									dmc->low_io_pressure_sched_interval * HZ);
+			dmc->is_low_pressure_clean_work_sched = 1;
+		}
+	}
+#endif
 }
+int cmp_dbn(const void *a, const void *b)
+{
+	const struct dbn_index_pair * ap = a;
+	const struct dbn_index_pair * bp = b;
+
+	return (ap->dbn > bp->dbn) ? 1 : -1;
+}
+
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN 
+int cmp_dirty_nr(const void *a, const void *b)
+{
+	const struct set_nr_dirty_pair * ap = a;
+	const struct set_nr_dirty_pair * bp = b;
+
+	return (ap->nr_dirty < bp->nr_dirty) ? 1 : -1;
+}
+#endif
+

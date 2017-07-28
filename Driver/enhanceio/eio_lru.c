@@ -318,5 +318,5 @@ module_init(lru_register);
 module_exit(lru_unregister);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("LRU policy for EnhanceIO");
-MODULE_AUTHOR("STEC, Inc. based on code by Facebook");
+MODULE_DESCRIPTION("LRU policy for WSsmartcache");
+MODULE_AUTHOR("WS, Inc. based on code by Facebook");

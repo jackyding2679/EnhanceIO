@@ -45,5 +45,9 @@ int lru_rem(struct lru_ls *llist, index_t index);
 int lru_touch(struct lru_ls *llist, index_t index, u_int64_t key);
 int lru_read_head(struct lru_ls *llist, index_t *index, u_int64_t *key);
 int lru_rem_head(struct lru_ls *llist, index_t *index, u_int64_t *key);
-
+#ifdef CONFIG_LOW_IO_PRESSURE_CLEAN 
+bool lru_empty(struct lru_ls *llist);
+int lru_scan(struct lru_ls *llist, struct set_nr_dirty_pair *array, 
+						int count, int *scanned_count, int scan_head);
+#endif
 #endif                          /* _EIO_SETLRU_H_ */

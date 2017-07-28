@@ -1,34 +1,34 @@
-.TH EIO_CLI 8 "May 25, 2012" "" "eio_cli"
+.TH EIO_CLI 8 "May 25, 2012" "" "wssc_cli"
 
 .SH NAME
-eio_cli \- EnhanceIO command line interface
+wssc_cli \- EnhanceIO command line interface
 
 .SH SYNOPSIS
-.B eio_cli create
+.B wssc_cli create
 .I -d <src device> -s <SSD device> [-p <policy>] [-m <cache mode>] [-b <block size>] -c <cache name>
 .br
-.B eio_cli delete 
+.B wssc_cli delete 
 .I -c <cache name>
 .br
-.B eio_cli clean 
+.B wssc_cli clean 
 .I -c <cache name>
 .br
-.B eio_cli info 
+.B wssc_cli info 
 .I
 .br
-.B eio_cli edit 
+.B wssc_cli edit 
 .I [-p <policy>] [-m <cache mode>] -c <cache name>
 .br
 
 .SH DESCRIPTION
 .B EnhanceIO 
 is a block device caching software that uses an SSD as cache for traditional HDDs. 
-The eio_cli command line interface is intended to serve the purpose of administering the caches. 
-The eio_cli command takes the first argument as a sub-command, rest of the arguments are options
+The wssc_cli command line interface is intended to serve the purpose of administering the caches. 
+The wssc_cli command takes the first argument as a sub-command, rest of the arguments are options
 specific to the sub-command. 
 
 .SH SUB-COMMANDS
-.SS "eio_cli create \fIoptions\fR"
+.SS "wssc_cli create \fIoptions\fR"
 .PP
 Creates a new cache by associating an SSD device with a source device\&.
 .PP
@@ -71,7 +71,7 @@ Specifies the block size of each single cache entry\&. Block size are:
 \fB8192\fR\&.
 .RE
 .PP
-.SS "eio_cli delete \fIoptions\fR"
+.SS "wssc_cli delete \fIoptions\fR"
 .RE
 .PP
 Deletes a pre-existing cache\&.
@@ -82,7 +82,7 @@ Deletes a pre-existing cache\&.
 Specifies the Cache name\&.
 .RE
 .PP
-.SS "eio_cli clean \fIoptions\fR"
+.SS "wssc_cli clean \fIoptions\fR"
 .RE
 .PP
 Cleans a pre-existing cache\&.
@@ -93,12 +93,12 @@ Cleans a pre-existing cache\&.
 Specifies the Cache name\&.
 .PP
 .RE
-.SS "eio_cli info"
+.SS "wssc_cli info"
 .PP
 Displays information of existing cache devices\&.
 .RE
 .RE
-.SS "eio_cli edit \fIoptions\fR"
+.SS "wssc_cli edit \fIoptions\fR"
 .PP
 Modifies the properties of a cache\&.
 .RE
@@ -128,22 +128,22 @@ Specifies the caching mode\&. Supported caching modes are:
 .SH EXAMPLES
 
 # Create a cache 
-    $ eio_cli create \-d /dev/sdg \-s /dev/sdf \-p lru \-m wt \-c SDG_CACHE
-    $ eio_cli create \-d /dev/sdm \-s /dev/sdk \-c SDM_CACHE
-    $ eio_cli create \-d /dev/sdc1 \-s /dev/sdd1 \-c SDC1_CACHE
+    $ wssc_cli create \-d /dev/sdg \-s /dev/sdf \-p lru \-m wt \-c SDG_CACHE
+    $ wssc_cli create \-d /dev/sdm \-s /dev/sdk \-c SDM_CACHE
+    $ wssc_cli create \-d /dev/sdc1 \-s /dev/sdd1 \-c SDC1_CACHE
 
 # Display properties of the cache devices 
-    $ eio_cli info 
+    $ wssc_cli info 
 
 # Edit the properties of the cache SDG_CACHE
-    $ eio_cli edit \-p fifo \-c SDG_CACHE
-    $ eio_cli edit \-p rand \-m ro \-c SDG_CACHE
+    $ wssc_cli edit \-p fifo \-c SDG_CACHE
+    $ wssc_cli edit \-p rand \-m ro \-c SDG_CACHE
 
 # Delete the cache SDG_CACHE
-    $ eio_cli clean \-c SDG_CACHE
+    $ wssc_cli clean \-c SDG_CACHE
 
 # Clean the cache SDG_CACHE
-    $ eio_cli clean \-c SDG_CACHE
+    $ wssc_cli clean \-c SDG_CACHE
 
 
 

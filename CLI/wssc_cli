@@ -52,7 +52,7 @@ udev_template = """
 ACTION!="add|change", GOTO="EIO_EOF"
 SUBSYSTEM!="block", GOTO="EIO_EOF"
 
-<cache_match_expr>, GOTO="EIO_CACHE"
+<cache_match_expr>, PROGRAM="/bin/sh -c 'sleep 1'", GOTO="EIO_CACHE"
 <source_match_expr>, GOTO="EIO_SOURCE"
 
 # If none of the rules above matched then it isn't an \
@@ -65,14 +65,14 @@ GOTO="EIO_EOF"
 exists then we can setup
 
 LABEL="EIO_CACHE"
-TEST!="/dev/enhanceio/<cache_name>", \
-PROGRAM="/bin/mkdir -p /dev/enhanceio/<cache_name>"
-PROGRAM="/bin/sh -c 'echo $kernel > /dev/enhanceio/<cache_name>/.ssd_name'"
-TEST=="/proc/enhanceio/<cache_name>", \
-RUN+="/sbin/eio_cli notify -a add -s /dev/$kernel -c <cache_name>", \
+TEST!="/dev/wssmartcache/<cache_name>", \
+PROGRAM="/bin/mkdir -p /dev/wssmartcache/<cache_name>"
+PROGRAM="/bin/sh -c 'echo $kernel > /dev/wssmartcache/<cache_name>/.ssd_name'"
+TEST=="/proc/wssmartcache/<cache_name>", \
+RUN+="/sbin/wssc_cli notify -a add -s /dev/$kernel -c <cache_name>", \
 GOTO="EIO_EOF"
 
-TEST=="/dev/enhanceio/<cache_name>/.disk_name", GOTO="EIO_SETUP"
+TEST=="/dev/wssmartcache/<cache_name>/.disk_name", GOTO="EIO_SETUP"
 
 GOTO="EIO_EOF"
 
@@ -82,59 +82,59 @@ GOTO="EIO_EOF"
 exists then we can setup
 
 LABEL="EIO_SOURCE"
-TEST=="/dev/enhanceio/<cache_name>/.eio_delete", GOTO="EIO_SOURCE_DELETE"
-TEST!="/dev/enhanceio/<cache_name>", PROGRAM="/bin/mkdir -p \
-/dev/enhanceio/<cache_name>"
-PROGRAM="/bin/sh -c 'echo $kernel > /dev/enhanceio/<cache_name>/.disk_name'"
+TEST=="/dev/wssmartcache/<cache_name>/.eio_delete", GOTO="EIO_SOURCE_DELETE"
+TEST!="/dev/wssmartcache/<cache_name>", PROGRAM="/bin/mkdir -p \
+/dev/wssmartcache/<cache_name>"
+PROGRAM="/bin/sh -c 'echo $kernel > /dev/wssmartcache/<cache_name>/.disk_name'"
 
 PROGRAM="/bin/sh -c 'echo $major $minor > \
-/dev/enhanceio/<cache_name>/.disk_mjr_mnr'"
+/dev/wssmartcache/<cache_name>/.disk_mjr_mnr'"
 
 PROGRAM="/bin/sh -c 'echo $links > \
-/dev/enhanceio/<cache_name>/.srclinks'"
+/dev/wssmartcache/<cache_name>/.srclinks'"
 
-TEST=="/proc/enhanceio/<cache_name>",\
-PROGRAM="/bin/grep 'state\s*failed' /proc/enhanceio/<cache_name>/config", \
-PROGRAM="/bin/grep 'no_source_dev\s*1' /proc/enhanceio/<cache_name>/errors", \
-RUN+="/sbin/eio_cli notify -a add -d /dev/$kernel -c <cache_name>", NAME="", \
+TEST=="/proc/wssmartcache/<cache_name>",\
+PROGRAM="/bin/grep 'state\s*failed' /proc/wssmartcache/<cache_name>/config", \
+PROGRAM="/bin/grep 'no_source_dev\s*1' /proc/wssmartcache/<cache_name>/errors", \
+RUN+="/sbin/wssc_cli notify -a add -d /dev/$kernel -c <cache_name>", NAME="", \
 GOTO="EIO_EOF"
 
-TEST!="/proc/enhanceio/<cache_name>", \
-TEST!="/dev/enhanceio/<cache_name>/.eio_delete", ACTION!="change", NAME=""
+TEST!="/proc/wssmartcache/<cache_name>", \
+TEST!="/dev/wssmartcache/<cache_name>/.eio_delete", ACTION!="change", NAME=""
 	
-TEST=="/dev/enhanceio/<cache_name>/.ssd_name", GOTO="EIO_SETUP"
+TEST=="/dev/wssmartcache/<cache_name>/.ssd_name", GOTO="EIO_SETUP"
 
 GOTO="EIO_EOF"
 
 #=================== EIO_SOURCE_DELETE =======================
 
 LABEL="EIO_SOURCE_DELETE"
-PROGRAM="/bin/sh -c 'cat /dev/enhanceio/<cache_name>/.disk_name'", \
+PROGRAM="/bin/sh -c 'cat /dev/wssmartcache/<cache_name>/.disk_name'", \
 ENV{disk_name}="%c"
-TEST=="/dev/enhanceio/<cache_name>/.disk_name", ENV{disk_name}=="?*", \
+TEST=="/dev/wssmartcache/<cache_name>/.disk_name", ENV{disk_name}=="?*", \
 NAME="$env{disk_name}"
-PROGRAM="/bin/unlink /dev/enhanceio/<cache_name>/.disk_name"
-PROGRAM="/bin/unlink /dev/enhanceio/<cache_name>/.disk_mjr_mnr"
+PROGRAM="/bin/unlink /dev/wssmartcache/<cache_name>/.disk_name"
+PROGRAM="/bin/unlink /dev/wssmartcache/<cache_name>/.disk_mjr_mnr"
 GOTO="EIO_EOF"
 #=================== EIO_SETUP =======================
 
 LABEL="EIO_SETUP"
-PROGRAM="/bin/sh -c 'cat /dev/enhanceio/<cache_name>/.ssd_name'", \
+PROGRAM="/bin/sh -c 'cat /dev/wssmartcache/<cache_name>/.ssd_name'", \
 ENV{ssd_name}="%c"
-PROGRAM="/bin/sh -c 'cat /dev/enhanceio/<cache_name>/.disk_name'", \
+PROGRAM="/bin/sh -c 'cat /dev/wssmartcache/<cache_name>/.disk_name'", \
 ENV{disk_name}="%c"
 
-TEST!="/proc/enhanceio/<cache_name>", \
-TEST!="/dev/enhanceio/<cache_name>/.skip_enable", \
+TEST!="/proc/wssmartcache/<cache_name>", \
+TEST!="/dev/wssmartcache/<cache_name>/.skip_enable", \
 RUN+="/bin/sh -c '/bin/mknod /dev/$env{disk_name} b \
-`/bin/cat /dev/enhanceio/<cache_name>/.disk_mjr_mnr`'"
+`/bin/cat /dev/wssmartcache/<cache_name>/.disk_mjr_mnr`'"
 
-TEST!="/proc/enhanceio/<cache_name>", \
-RUN+="/bin/sh -c ' for i in `cat /dev/enhanceio/<cache_name>/.srclinks`; \
+TEST!="/proc/wssmartcache/<cache_name>", \
+RUN+="/bin/sh -c ' for i in `cat /dev/wssmartcache/<cache_name>/.srclinks`; \
 do rm -f /dev/$$i; ln -f -s /dev/$env{disk_name} /dev/$$i; done'"
 
 
-TEST!="/proc/enhanceio/<cache_name>", RUN+="/sbin/eio_cli \
+TEST!="/proc/wssmartcache/<cache_name>", RUN+="/sbin/wssc_cli \
 enable -d /dev/$env{disk_name} -s /dev/$env{ssd_name} -m <mode> \
 -b <block_size> -p <policy> -c <cache_name>"
 
@@ -214,7 +214,7 @@ def run_cmd(cmd):
 def get_caches_list():
 	
 	#Utility function that obtains cache list 
-	cache_list = [f for f in os.listdir('/proc/enhanceio/')]
+	cache_list = [f for f in os.listdir('/proc/wssmartcache/')]
 	for name in cache_list:
 		if name == "version":
 			cache_list.remove(name)
@@ -295,8 +295,8 @@ class Cache_rec(Structure):
 		print "Block Size       : " + str(self.blksize)	
 		print "Associativity    : " + str(self.assoc)	
 
-		if os.path.exists("/proc/enhanceio/" + self.name):
-			cmd = "cat /proc/enhanceio/" + self.name + "/config" + " | grep state"
+		if os.path.exists("/proc/wssmartcache/" + self.name):
+			cmd = "cat /proc/wssmartcache/" + self.name + "/config" + " | grep state"
 			status = run_cmd(cmd)
 			print "State            : " + status.output.split()[1]
 	
@@ -317,37 +317,37 @@ class Cache_rec(Structure):
 		
 	def clean(self):
 		#do sysctl corresponding to clean
-		cmd = "/sbin/sysctl dev.enhanceio." + self.name + ".do_clean=1"
+		cmd = "/sbin/sysctl dev.wssmartcache." + self.name + ".do_clean=1"
 		print cmd
 		run_cmd(cmd)	
 		pass
 
 	
 	def get_cache_info(self):
-		#function to extract information from /proc/enhanceio
+		#function to extract information from /proc/wssmartcache
 		status = Status()
 		
-		if os.path.exists("/proc/enhanceio/" + self.name):
+		if os.path.exists("/proc/wssmartcache/" + self.name):
 
 			associativity = {2048:128, 4096:256, 8192:512,0:0}
 				
-			cmd = "cat /proc/enhanceio/" + self.name + "/config" + " | grep src_name" 
+			cmd = "cat /proc/wssmartcache/" + self.name + "/config" + " | grep src_name" 
 			status = run_cmd(cmd)
 			self.src_name =  status.output.split()[1]
 
-			cmd = "cat /proc/enhanceio/" + self.name + "/config" + " | grep ssd_name"
+			cmd = "cat /proc/wssmartcache/" + self.name + "/config" + " | grep ssd_name"
 			status = run_cmd(cmd)
 			self.ssd_name = status.output.split()[1]
 	
-			cmd = "cat /proc/enhanceio/" + self.name + "/config" + " | grep mode"
+			cmd = "cat /proc/wssmartcache/" + self.name + "/config" + " | grep mode"
 			status = run_cmd(cmd)
 			self.mode = int(status.output.split()[1])
 
-			cmd = "cat /proc/enhanceio/" + self.name + "/config" + " | grep eviction"
+			cmd = "cat /proc/wssmartcache/" + self.name + "/config" + " | grep eviction"
 			status = run_cmd(cmd)
 			self.policy = int(status.output.split()[1])
 
-			cmd = "cat /proc/enhanceio/" + self.name + "/config" + " | grep block_size"
+			cmd = "cat /proc/wssmartcache/" + self.name + "/config" + " | grep block_size"
 			status = run_cmd(cmd)
 			self.blksize = int(status.output.split()[1])
 
@@ -423,7 +423,7 @@ class Cache_rec(Structure):
 				    policies[self.policy])	
 
 			# write rule file
-			rule_file_path = "/etc/udev/rules.d/94-enhanceio-" + \
+			rule_file_path = "/etc/udev/rules.d/94-wssmartcache-" + \
 					self.name + ".rules" 
 			rule_file = open(rule_file_path, "w")
 			rule_file.write(udev_rule)
@@ -440,7 +440,7 @@ class Cache_rec(Structure):
 			print "No cache exists with the name " + self.name
 			return FAILURE
 
-		run_cmd("/bin/touch /dev/enhanceio/" + self.name + "/.eio_delete")
+		run_cmd("/bin/touch /dev/wssmartcache/" + self.name + "/.eio_delete")
 
 		if self.do_eio_ioctl(EIO_IOC_DELETE) == SUCCESS:
 			if self.delete_rules() == SUCCESS:
@@ -448,14 +448,14 @@ class Cache_rec(Structure):
 		else: 	
 			print 'Cache deletion failed (dmesg can provide you more info)'
 		
-		run_cmd("/bin/rm -f /dev/enhanceio/" + self.name + "/.eio_delete")
+		run_cmd("/bin/rm -f /dev/wssmartcache/" + self.name + "/.eio_delete")
 		
 		return FAILURE
 
 						
 	def delete_rules(self):
 				
-		rule_file_path = "/etc/udev/rules.d/94-enhanceio-" + self.name + ".rules" 
+		rule_file_path = "/etc/udev/rules.d/94-wssmartcache-" + self.name + ".rules" 
 		print "Removing file" + rule_file_path
 		try:	
 			os.remove(rule_file_path)
@@ -579,10 +579,10 @@ def main():
 	mainparser = create_parser()
 	args = mainparser.parse_args()
 
-	run_cmd("/sbin/modprobe enhanceio")
-	run_cmd("/sbin/modprobe enhanceio_fifo")
-	run_cmd("/sbin/modprobe enhanceio_lru")
-	run_cmd("/sbin/modprobe enhanceio_rand")
+	run_cmd("/sbin/modprobe wssmartcache")
+	run_cmd("/sbin/modprobe wssmartcache_fifo")
+	run_cmd("/sbin/modprobe wssmartcache_lru")
+	run_cmd("/sbin/modprobe wssmartcache_rand")
 
 	if sys.argv[1] == "create":
 
@@ -607,7 +607,7 @@ def main():
 				cache.print_info()
 
 			print "\nFor more information look at " + \
-			      "/proc/enhanceio/<cache_name>/config"
+			      "/proc/wssmartcache/<cache_name>/config"
 		return SUCCESS
 
 	elif sys.argv[1] == "edit":
@@ -644,8 +644,8 @@ def main():
 				
 			elif args.hdd:
 				cache = Cache_rec(name = args.cache,\
-						ssd_name = args.hdd, persistence = 1)
-				cache.do_eio_ioctl(EIO_IOC_HDD_ADD)
+						src_name = args.hdd, persistence = 1)
+				cache.do_eio_ioctl(EIO_IOC_SRC_ADD)
 
 		elif args.action == "remove":
 			if args.ssd:
@@ -655,7 +655,7 @@ def main():
 			elif args.hdd:
 				cache = Cache_rec(name = args.cache, hdd_name = args.hdd,\
 						persistence = 1)
-				cache.do_eio_ioctl(EIO_HDD_REMOVE)
+				cache.do_eio_ioctl(EIO_SRC_REMOVE)
 
 		pass
 
