@@ -78,6 +78,27 @@ static void eio_check_dirty_cache_thresholds(struct cache_c *dmc);
 static void eio_post_mdupdate(struct work_struct *work);
 static void eio_post_io_callback(struct work_struct *work);
 static int add_to_cleanq_low_io_pressure(struct cache_c *dmc, int count);
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+static int seq_io_md_update(struct cache_c *dmc, 
+									struct seqio_set_block *set_block);
+static void seq_io_post_callback(struct work_struct *work);
+static void seq_io_callback(int error, void *context);
+static int seq_io_alloc_mdupdate_mem(struct bio_container *bc);
+//static void seq_io_free_mdupdate_mem(struct bio_container *bc);
+static void seq_io_free_set_block(struct bio_container *bc);
+static void
+seq_io_disk_io(struct cache_c *dmc, struct bio_container *bc, struct bio *bio);
+#if 0
+static void 
+seq_io_free_set_block(struct bio_container *bc);
+static struct seqio_set_block * 
+seq_io_get_set_block(struct bio_container *bc);
+#endif
+static int seq_io_inval_bio_range(struct cache_c *dmc, 
+												struct bio_container *bc);
+static int 
+seq_io_detect_seqential_io(struct cache_c *dmc, struct bio *bio);
+#endif
 static void bc_addfb(struct bio_container *bc, struct eio_bio *ebio)
 {
 
@@ -90,8 +111,7 @@ static void bc_put(struct bio_container *bc, unsigned int doneio)
 {
 	struct cache_c *dmc;
 	int data_dir;
-	long elapsed;	
-	unsigned long flags = 0;
+	long elapsed;
 
 	if (atomic_dec_and_test(&bc->bc_holdcount)) {
 		if (bc->bc_dmc->mode == CACHE_MODE_WB)
@@ -106,7 +126,15 @@ static void bc_put(struct bio_container *bc, unsigned int doneio)
 		/* update iotime for latency */
 		data_dir = bio_data_dir(bc->bc_bio);
 		elapsed = (long)jiffies_to_msecs(jiffies - bc->bc_iotime);
-
+		#if 0
+ 		if (data_dir == WRITE) {
+			EIO_DBG(ERROR, dmc, "%s:bio_alltime:%lu, bio_locktime:%lu, bio_rwtime:%lu\n",
+				(UNCACHED_WRITE == bc->bc_dir) ? "Uncache write" : "Cache write", 
+				elapsed, (long)jiffies_to_msecs(bc->bc_locktime - bc->bc_iotime),
+				(long)jiffies_to_msecs(jiffies - bc->bc_locktime));
+		}
+		#endif
+		
 		if (data_dir == READ)
 			atomic64_add(elapsed, &dmc->eio_stats.rdtime_ms);
 		else
@@ -114,12 +142,8 @@ static void bc_put(struct bio_container *bc, unsigned int doneio)
 
 		bio_endio(bc->bc_bio, bc->bc_error);
 		atomic64_dec(&bc->bc_dmc->nr_ios);
+		kfree(bc);
 		
-		spin_lock_irqsave(&dmc->bc_free_lock, flags);
-		atomic64_set(&bc->bc_id, 0);
-		bc->bc_magic = 0;
- 		kfree(bc);	
-		spin_unlock_irqrestore(&dmc->bc_free_lock, flags);
 	}
 }
 
@@ -704,11 +728,10 @@ int eio_clean_thread_proc(void *context)
 
 		if (dmc->sysctl_active.do_clean) {
 			/* pause the periodic clean */
+			
 			cancel_delayed_work_sync(&dmc->clean_aged_sets_work);
-
 			/* clean all the sets */
 			eio_clean_all(dmc);
-
 			/* resume the periodic clean */
 			spin_lock_irqsave(&dmc->dirty_set_lru_lock, flags);
 			dmc->is_clean_aged_sets_sched = 0;
@@ -782,6 +805,27 @@ int eio_clean_thread_proc(void *context)
 					continue;
 				}
 			}
+		#endif
+		
+		#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+		spin_lock_irqsave(&dmc->cache_sets[index].cs_lock, flags);
+		/*this cache set is doing sequetial IO,do not flush*/
+		if (dmc->cache_sets[index].flags & SETFLAG_SKIP_SEQUENTIAL_IO) {
+			/*clear all flags expect SETFLAG_SKIP_SEQUENTIAL_IO,clear flag 
+			SETFLAG_SKIP_SEQUENTIAL_IO when sequentail IO done*/
+			dmc->cache_sets[index].flags &=
+				~(SETFLAG_CLEAN_INPROG |
+				  SETFLAG_CLEAN_WHOLE 
+				  #ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
+				  |SETFLAG_CLEAN_LOW_IO_PRESSURE
+				  #endif
+				  );
+			atomic64_inc(&dmc->eio_stats.seq_io_dirty);			
+			spin_unlock_irqrestore(&dmc->cache_sets[index].cs_lock, flags);
+			continue;
+		}
+		spin_unlock_irqrestore(&dmc->cache_sets[index].
+					   cs_lock, flags);
 		#endif
 
 			clean_set_array[nr_to_clean++] = index;
@@ -1557,10 +1601,7 @@ static void eio_enq_mdupdate(struct bio_container *bc)
 	struct cache_set *set = NULL;
 	struct mdupdate_request *mdreq;
 	int do_schedule;
-	unsigned long bc_id1, bc_id2;
-	u_int32_t bc_magic;
- 
-	bc_id1 = atomic64_read(&bc->bc_id);
+
 	ebio = bc->bc_mdlist;
 	set_index = -1;
 	do_schedule = 0;
@@ -1604,22 +1645,7 @@ static void eio_enq_mdupdate(struct bio_container *bc)
 		}
 	}
 
-	spin_lock_irqsave(&dmc->bc_free_lock, flags);
- 	bc_id2 = atomic64_read(&bc->bc_id);
-	bc_magic = bc->bc_magic;
-	if ((bc_id2 == bc_id1) && (BC_MAGIC == bc_magic)) {
-		EIO_ASSERT(bc->bc_mdlist == NULL);
-		spin_unlock_irqrestore(&dmc->bc_free_lock, flags);
-	} else {
-		spin_unlock_irqrestore(&dmc->bc_free_lock, flags);
- 		printk(KERN_ERR "%s:bc_id1:%lu, bc_id2:%lu, bc_maigc:%x\n", 
-				dmc->cache_name, bc_id1, bc_id2, bc_magic);
-		if (0 == bc_id2 && 0 == bc_magic) {
-			printk(KERN_ERR "%s:bio_container has been freed!!!\n", dmc->cache_name);
-		} else {
-			printk(KERN_ERR "%s:bio_container unexpected changed!!!\n", dmc->cache_name);			
-		}
-	}	
+	EIO_ASSERT(bc->bc_mdlist == NULL);
 }
 
 /* Kick-off a cache metadata update for marking the blocks dirty */
@@ -2413,6 +2439,8 @@ static int eio_acquire_set_locks(struct cache_c *dmc, struct bio_container *bc)
 	struct set_seq *cur_seq;
 	struct set_seq *next_seq;
 	int error;
+	unsigned long before_lock;
+	unsigned long after_lock;
 
 	/*
 	 * Find first set using start offset of the I/O and lock it.
@@ -2479,12 +2507,18 @@ static int eio_acquire_set_locks(struct cache_c *dmc, struct bio_container *bc)
 	}
 
 	/* Acquire read locks on the sets in the set span */
-	down_write(&dmc->muti_set_op_protect);
 	for (cur_seq = bc->bc_setspan; cur_seq; cur_seq = cur_seq->next)
-		for (i = cur_seq->first_set; i <= cur_seq->last_set; i++)
+		for (i = cur_seq->first_set; i <= cur_seq->last_set; i++) {
+			before_lock = jiffies;
 			down_read(&dmc->cache_sets[i].rw_lock);
-	up_write(&dmc->muti_set_op_protect);
+			after_lock = jiffies;
+			//EIO_DBG(INFO, dmc, "------set[%u] get read lock:%u ms------,", (unsigned int)i, 
+				//jiffies_to_msecs(after_lock - before_lock));
+		}
+		
+		//EIO_DBG(INFO, dmc, "---\n");
 
+	bc->bc_locktime = jiffies;
 	return 0;
 
 err_out:
@@ -2635,14 +2669,18 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 	unsigned int totalio;
 	unsigned int biosize;
 	unsigned int residual_biovec;
-	unsigned int force_uncached = 0;
-	int data_dir = bio_data_dir(bio);
+	unsigned int force_uncached = 0;	
+	unsigned int skip_flag1 = 0;
+	unsigned int skip_flag2 = 0;
+	int data_dir = bio_data_dir(bio);	
+	unsigned long flags;
+	unsigned long wr_ioc; 
+	unsigned long wr_ioc_small;
 
 	/*bio list*/
 	struct eio_bio *ebegin = NULL;
 	struct eio_bio *eend = NULL;
 	struct eio_bio *enext = NULL;
-	unsigned long flags = 0;
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
 	EIO_ASSERT(bio->bi_iter.bi_idx == 0);
@@ -2740,7 +2778,7 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 		eio_process_zero_size_bio(dmc, bio);
 		return DM_MAPIO_SUBMITTED;
 	}
-
+	
 	/* Create a bio container */
 
 	bc = kzalloc(sizeof(struct bio_container), GFP_NOWAIT);
@@ -2748,12 +2786,6 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 		bio_endio(bio, -ENOMEM);
 		return DM_MAPIO_SUBMITTED;
 	}
-	/*fix issues 2253*/
-	spin_lock_irqsave(&dmc->bc_id_lock, flags);
-	atomic64_set(&bc->bc_id, dmc->bc_id);
-	dmc->bc_id++;
-	spin_unlock_irqrestore(&dmc->bc_id_lock, flags);
-	bc->bc_magic = BC_MAGIC;
 	bc->bc_iotime = jiffies;
 	bc->bc_bio = bio;
 	bc->bc_dmc = dmc;
@@ -2771,8 +2803,50 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 	biosize = bio->bi_size;
 #endif 
 	residual_biovec = 0;
+	//EIO_DBG(ERROR, dmc, "----biosize:[%u]KByte\n", TO_KB(totalio));
 
-	if (dmc->mode == CACHE_MODE_WB) {
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+	bc->set_block = NULL;
+	/*Check sequential write io*/
+	if (data_dir == WRITE && dmc->mode == CACHE_MODE_WB &&
+			dmc->sysctl_active.seqio_threshold_len_kb > 0) {
+		/*caculate the percent of small IO(io size < 32KB)*/
+		//spin_lock_irqsave(&dmc->seq_io_lock, flags);
+		atomic64_inc(&dmc->wr_ioc);
+		if (TO_KB(biosize) <= SEQIO_SKIP_DECTECT_BIO_SIZE) {
+			atomic64_inc(&dmc->wr_ioc_small);
+		}
+		
+		if (time_after(jiffies, 
+				dmc->pct_update_time + SEQIO_UPDATE_PCT_INTERVAL)) {
+			wr_ioc = atomic64_read(&dmc->wr_ioc);
+			if (wr_ioc >= SEQIO_SMALL_IO_COUNT) {
+				int percent;				
+				wr_ioc_small = atomic64_read(&dmc->wr_ioc_small);
+				percent = EIO_CALCULATE_PERCENTAGE(wr_ioc_small, wr_ioc);			
+				dmc->detect_flag = (percent < SEQIO_SMALL_IO_PCT) ? (int)1 : (int)0;
+				EIO_DBG(ERROR, dmc, "small IO percent is %u, flag is %u\n",
+						percent, dmc->detect_flag);
+				atomic64_set(&dmc->wr_ioc, 0);
+				atomic64_set(&dmc->wr_ioc_small, 0);
+				dmc->pct_update_time = jiffies;
+			}
+		}
+
+		if (dmc->detect_flag) {
+		
+			spin_lock_irqsave(&dmc->seq_io_lock, flags);
+			skip_flag1 = seq_io_detect_seqential_io(dmc, bio);
+			spin_unlock_irqrestore(&dmc->seq_io_lock, flags);
+
+			if (skip_flag1) {
+				skip_flag2 = seq_io_inval_bio_range(dmc, bc);
+			}
+		}
+	}
+#endif
+
+	if (dmc->mode == CACHE_MODE_WB && !skip_flag2) {
 		int ret;
 		/*
 		 * For writeback, the app I/O and the clean I/Os
@@ -2797,9 +2871,24 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 	 * - If force uncached I/O is set, invalidate the cache blocks for the I/O
 	 */
 
-	if (force_uncached)
-		eio_inval_range(dmc, snum, totalio);
-	else {
+	if (skip_flag2 || force_uncached) {
+		if (force_uncached) {
+			eio_inval_range(dmc, snum, totalio);
+		}
+	} else {
+		
+		//print bio
+		//int i;
+		//struct bio_vec *bv;
+		//pr_err("----------------------------------------\n");
+		//pr_err("---bio_sector:0x%lx, bio_size:0x%x,bvec_cnt:0x%x\n", bio->bi_sector, bio->bi_size, bio->bi_vcnt);
+		
+		//bio_for_each_segment(bv, bio, i) {	
+		//	pr_err("---bvec[%d]:bvec_len:0x%x,bvec_offset:0x%x\n", i, bv->bv_len, bv->bv_offset);
+		//}
+
+		//i = 0;
+		
 		while (biosize) {
 			iosize = eio_get_iosize(dmc, snum, biosize);
 			ebio = eio_new_ebio(dmc, bio, &residual_biovec, snum,
@@ -2818,6 +2907,9 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 
 			biosize -= iosize;
 			snum += eio_to_sector(iosize);
+			
+			//pr_err("---ebio[%d]:eb_size:0x%x,eb_sector:0x%lx,eb_nbvec:0x%x\n", i, ebio->eb_size, ebio->eb_sector, ebio->eb_nbvec);
+			//i++;
 		}
 	}
 
@@ -2844,7 +2936,11 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 	 *      Error handling would be done as part of
 	 *      the processing of the ebios internally.
 	 */
-	if (force_uncached) {
+	 if (skip_flag2) {
+	 	atomic64_inc(&dmc->eio_stats.seq_io_write_count);
+		atomic64_add(eio_to_sector(bio->bi_size), &dmc->eio_stats.seq_io_write_size);
+		seq_io_disk_io(dmc, bc, bio);
+	 }else if (force_uncached) {
 		EIO_ASSERT(dmc->mode != CACHE_MODE_WB);
 		if (data_dir == READ)
 			atomic64_inc(&dmc->eio_stats.uncached_reads);
@@ -2856,8 +2952,6 @@ int eio_map(struct cache_c *dmc, struct request_queue *rq, struct bio *bio)
 		/* read io processing */
 		eio_read(dmc, bc, ebegin);
 	} else
-        
-	    
 		/* write io processing */
 		eio_write(dmc, bc, ebegin);
 
@@ -3314,7 +3408,7 @@ eio_get_setblks_to_clean(struct cache_c *dmc, index_t set, int *ncleans)
 	int nr_writes = 0;
 
 	*ncleans = 0;
-
+	
 	max_clean = dmc->cache_sets[set].nr_dirty -
 		    ((dmc->sysctl_active.dirty_set_low_threshold * dmc->assoc) / 100);
 	if (max_clean <= 0)
@@ -3457,7 +3551,6 @@ eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force
 	 * 8. update on-disk cache metadata
 	 */
 
-    down_write(&dmc->muti_set_op_protect);
 	for (k = 0; k < nr_set; k++) {		
 		set = set_array[k];
 
@@ -3471,7 +3564,6 @@ eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force
 		}
 		ttl_nr_dirty += dmc->cache_sets[set].nr_dirty;
 	}
-	up_write(&dmc->muti_set_op_protect);
 	if (0 == ttl_nr_dirty) {
 		//pr_err("------no dirty block------\n");
 		goto err_out2;
@@ -3481,6 +3573,9 @@ eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force
 	EIO_DBG(DEBUG, dmc, "------START READ:%ums------\n", jiffies_to_msecs(start_read));
 	for (k = 0; k < nr_set; k++) {
 		set = set_array[k];
+		if (0 == dmc->cache_sets[set].nr_dirty) {
+			continue;
+		}
 		start_index = set * dmc->assoc;
 		end_index = start_index + dmc->assoc;
 		
@@ -3681,7 +3776,10 @@ eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force
 	alloc_size = dmc->assoc * sizeof(struct flash_cacheblock);
 	
 	for (k = 0; k < nr_set; k++) {
-		set = set_array[k];
+		set = set_array[k];	
+		if (0 == dmc->cache_sets[set].nr_dirty) {
+			continue;
+		}
 		start_index = set * dmc->assoc;
 		end_index = start_index + dmc->assoc;
 		
@@ -3747,7 +3845,10 @@ eio_clean_n_sets(struct cache_c *dmc, index_t set_array[], int nr_set, int force
 		 */
 		 
 		for (k = 0; k < nr_set; k++) {
-			set = set_array[k];
+			set = set_array[k];		
+			if (0 == dmc->cache_sets[set].nr_dirty) {
+				continue;
+			}
 			start_index = set * dmc->assoc;
 			end_index = start_index + dmc->assoc;
 			for (i = start_index; i < end_index; i++) {
@@ -3818,6 +3919,10 @@ eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
 	unsigned nr_bvecs = 0, total;
 	void *pg_virt_addr[2] = { NULL };
 
+	/*IOÅÅÐò*/
+	//struct dbn_index_pair sort_array[512] = {{0, 0}};
+	//int nr_sort = 0;
+
 	/* Cache is failed mode, do nothing. */
 	if (unlikely(CACHE_FAILED_IS_SET(dmc))) {
 		pr_debug("clean_set: CACHE \"%s\" is in FAILED state.",
@@ -3862,7 +3967,7 @@ eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
 		for (i = start_index; i < end_index; i++) {
 			if (EIO_CACHE_STATE_GET(dmc, i) == ALREADY_DIRTY) {
 				EIO_CACHE_STATE_SET(dmc, i, CLEAN_INPROG);
-				ncleans++;
+				ncleans++;				
 			}
 		}
 	}
@@ -3870,7 +3975,25 @@ eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
 	/* If nothing to clean, return */
 	if (!ncleans)
 		goto err_out2;
-
+	#if 0
+	EIO_DBG(DEBUG, dmc, "------CLEAN set[0x%lx], whole[%d], ncleans[0x%x]------", set, whole, ncleans);
+	/*add CLEAN_INPROG cache block to sort_array*/
+	for (i = start_index; i < end_index; i++) {
+		if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG) {
+			sort_array[nr_sort].dbn = EIO_DBN_GET(dmc, i);
+			sort_array[nr_sort].index = i;
+			nr_sort++;
+		}
+	}
+	EIO_ASSERT(nr_sort == ncleans);
+	#endif
+	#if 0
+	EIO_DBG("------BEFORE SORT------");
+	for (k = 0; k < nr_sort; k++) {
+		EIO_DBG("---block index[0x%lx], dbn[0x%lx]", \
+				sort_array[k].index, sort_array[k].dbn);
+	}
+	#endif
 	/*
 	 * From this point onwards, make sure to reset
 	 * the clean inflag on cache blocks before returning
@@ -3883,7 +4006,7 @@ eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
 
 	for (i = start_index; i < end_index; i++) {
 		if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG) {
-
+			
 			for (j = i; ((j < end_index) &&
 				(EIO_CACHE_STATE_GET(dmc, j) == CLEAN_INPROG));
 				j++);
@@ -3943,6 +4066,53 @@ eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
 	 * BIO_RW_SYNC flag to hint higher priority for these
 	 * I/Os.
 	 */
+
+	/*heapsort sort_array*/
+	//heap_sort(sort_array, ncleans);
+	//sort(sort_array, ncleans, sizeof(sort_array[0]), cmp_dbn, NULL);
+	
+	#if 0
+	EIO_DBG("------AFTER SORT------");
+	for (k = 0; k < nr_sort; k++) {
+		EIO_DBG("---block index[0x%lx], dbn[0x%lx]", \
+				sort_array[k].index, sort_array[k].dbn);
+	}
+	#endif
+
+	#if 0
+	for (k = 0; k < nr_sort; k++) {
+		
+		blkindex = sort_array[k].index - start_index;
+		total = 1;
+		
+		EIO_ASSERT(blkindex < dmc->assoc);
+		bvecs = setup_bio_vecs(dmc->clean_dbvecs, blkindex,
+					   dmc->block_size, total, &nr_bvecs);
+
+		EIO_ASSERT(bvecs != NULL);
+		EIO_ASSERT(bvecs->bv_page != NULL);
+		EIO_ASSERT(nr_bvecs > 0);
+		
+		where.bdev = dmc->disk_dev->bdev;
+		where.sector = sort_array[k].dbn;
+		where.count = dmc->block_size;
+		
+		SECTOR_STATS(dmc->eio_stats.disk_writes,
+				 to_bytes(where.count));
+		down_read(&sioc.sio_lock);
+		error = eio_io_async_bvec(dmc, &where, WRITE | REQ_SYNC,
+					  bvecs, nr_bvecs,
+					  eio_sync_io_callback, &sioc,
+					  1);
+		
+		if (error) {
+			sioc.sio_error = error;
+			up_read(&sioc.sio_lock);
+		}
+		bvecs = NULL;
+	}
+	#endif
+	#if 1
 	for (i = start_index; i < end_index; i++) {
 		if (EIO_CACHE_STATE_GET(dmc, i) == CLEAN_INPROG) {
 
@@ -3974,7 +4144,7 @@ eio_clean_set(struct cache_c *dmc, index_t set, int whole, int force)
 			bvecs = NULL;
 		}
 	}
-
+	#endif
 	/* wait for all I/Os to complete and release sync lock */
 	down_write(&sioc.sio_lock);
 	up_write(&sioc.sio_lock);
@@ -4115,7 +4285,7 @@ void eio_clean_aged_sets(struct work_struct *work)
 
 		return;
 	}
-
+	
 	cur_time = jiffies;
 
 	/* Use the set LRU list to pick up the most aged sets. */
@@ -4428,3 +4598,1172 @@ int cmp_dirty_nr(const void *a, const void *b)
 }
 #endif
 
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+#if 0
+struct seqio_node *wssc_search_seqio(struct cache_c *dmc, sector_t sect)
+{
+	unsigned long flags;
+	struct rb_node *node;
+
+	/*Get seqio_rbtree_lock*/
+	spin_lock_irqsave(&dmc->seqio_rbtree_lock, flags);
+	node = dmc->seqio_rbroot.rb_node;
+
+	/*Search the rbtree*/
+	while (node) {
+		struct seqio_node *seqio = container_of(node, struct seqio_node, rb);
+
+		/*Found seqential IO or write the same sector*/
+		if (sect == (seqio->most_recent_sector + seqio->last_bio_size)
+			  || sect == seqio->most_recent_sector) {
+
+			if (sect == seqio->most_recent_sector) {
+				EIO_DBG(INFO, dmc, "wssc_search_seqio: write the same sector\n");
+			} else {
+				EIO_DBG(INFO, dmc, "wssc_search_seqio: sequential io found\n");
+			}
+			
+			spin_unlock_irqrestore(&dmc->seqio_rbtree_lock, flags);
+			return seqio;
+		} 
+
+		/*Search left or right*/
+		if (sect < seqio->most_recent_sector) {
+			node = node->rb_left;
+		} else {		
+			node = node->rb_right;
+		}
+ 	}
+	spin_unlock_irqrestore(&dmc->seqio_rbtree_lock, flags);
+
+	return NULL;
+}
+struct seqio_node wssc_remove_seqio(struct cache_c *dmc, sector_t sect)
+{
+}
+struct seqio_node wssc_insert_seqio(struct cache_c *dmc, sector_t sect)
+{
+}
+int wssc_detect_seqential_io(struct cache_c *dmc, struct bio *bio)
+{
+	struct seqio_node *seqio;
+
+	/*Search the rbtree to find sequential IO*/
+	seqio = wssc_search_seqio(dmc, bio->bi_sector);
+	if (seqio) {
+		/*Found sequential io, check if sequential_size_bytes gets threshold*/
+		seqio->most_recent_sector = bio->bi_sector;
+		seqio->sequential_size_bytes += to_bytes(bio->bi_size);
+		seqio->last_bio_size = bio->bi_size;
+	}
+	
+}
+#endif
+#if 0
+static void seq_io_post_mdupdate(struct work_struct *work)
+{
+	struct seqio_set_block *set_block;
+	struct bio_container *bc;
+	struct cache_c *dmc;
+	u_int32_t i;
+	index_t set, blk_index;
+
+	set_block = container_of(work, struct seqio_set_block, work);
+	bc = set_block->bc;
+	dmc = bc->bc_dmc;
+
+	/*update statistic*/
+	for (i = 0; i < set_block->block_nr; i++) {
+		blk_index = set_block->dirty_blocks[i];
+		if (EIO_CACHE_STATE_GET(dmc, blk_index) == ALREADY_DIRTY) {
+			EIO_ASSERT(dmc->cache_sets[set].nr_dirty > 0);
+			dmc->cache_sets[set].nr_dirty--;
+			EIO_ASSERT(atomic64_read(&dmc->nr_dirty) > 0);
+			atomic64_dec(&dmc->nr_dirty);
+		}
+	}
+
+}
+/* Callback function for ondisk metadata update when trigger seqential io*/
+static void seq_io_mdupdate_callback(int error, void *context)
+{
+	struct seqio_set_block *set_block = (struct seqio_set_block *)context;
+	struct cache_c *dmc = set_block->bc->bc_dmc;
+
+	if (error && !(set_block->error)) {
+		set_block->error = error;
+	}
+	
+	if (!atomic_dec_and_test(&set_block->holdcount)) {
+		return;
+	}
+	
+	INIT_WORK(&set_block->work, seq_io_post_mdupdate);
+	queue_work(dmc->mdupdate_q, &set_block->work);
+}
+#endif
+
+/*function to update on-ssd-disk metadata*/
+static int seq_io_md_update(struct cache_c *dmc, 
+									struct seqio_set_block *set_block)
+{	
+	index_t set_index;
+	index_t start_index, end_index, i;
+	index_t blk_index;
+	int j, k;
+	int pindex;
+	void *pg_virt_addr[2] = { NULL };	
+	u_int8_t sector_bits[2] = { 0 };
+	struct flash_cacheblock *md_blocks;
+	//int md_size;
+	int startbit, endbit;
+	int rw_flags = 0;	
+	struct eio_io_region region;
+	int error;
+	unsigned long flags;
+
+	EIO_ASSERT(dmc != NULL && set_block != NULL);	
+	//EIO_ASSERT((dmc->assoc == 256) || (dmc->assoc == 512));
+	EIO_ASSERT(set_block->block_nr <= 256);	
+	EIO_ASSERT(set_block->mdbvec_count && set_block->mdbvec_count <= 2);
+	set_index = set_block->set_index;
+	start_index = set_index * dmc->assoc;
+	end_index = start_index + dmc->assoc;
+	
+
+	for (k = 0; k < set_block->mdbvec_count; k++) {
+		pg_virt_addr[k] = kmap(set_block->mdblk_bvecs[k].bv_page);
+
+	}
+
+	spin_lock_irqsave(&dmc->cache_sets[set_index].cs_lock, flags);
+
+	pindex = 0;
+	md_blocks = (struct flash_cacheblock *)pg_virt_addr[pindex];
+	j = MD_BLOCKS_PER_PAGE;
+	/* initialize the md blocks to write */
+	for (i = start_index; i < end_index; i++) {
+		md_blocks->dbn = cpu_to_le64(EIO_DBN_GET(dmc, i));	
+		if (EIO_CACHE_STATE_GET(dmc, i) == ALREADY_DIRTY) {
+			md_blocks->cache_state = cpu_to_le64((VALID | DIRTY));
+		} else {
+			md_blocks->cache_state = cpu_to_le64(INVALID);
+		}
+		md_blocks++;
+		j--;
+	
+		if (j == 0 && ++pindex < set_block->mdbvec_count) {
+			md_blocks =
+				(struct flash_cacheblock *)pg_virt_addr[pindex];
+			j = MD_BLOCKS_PER_PAGE;
+		}
+	}
+
+	/*update dirty block to invalid*/	
+	pindex = 0;
+	md_blocks = (struct flash_cacheblock *)pg_virt_addr[pindex];
+	for (i = 0; i < set_block->block_nr; i++) {
+		/*the cache block state may change before get rwlock, so we 
+		check again*/
+		if (EIO_CACHE_STATE_GET(dmc, set_block->block_index[i]) ==
+				ALREADY_DIRTY) {
+			blk_index = set_block->block_index[i] - start_index;
+			EIO_VERIFY((blk_index >= 0) && (blk_index <= 512));
+			pindex = INDEX_TO_MD_PAGE(blk_index);
+			EIO_VERIFY(pindex == 0 || pindex == 1);			
+			blk_index = INDEX_TO_MD_PAGE_OFFSET(blk_index);
+			sector_bits[pindex] |= (1 << INDEX_TO_MD_SECTOR(blk_index));
+			md_blocks = (struct flash_cacheblock *)pg_virt_addr[pindex];
+			/*invalidate the dirty cache block*/
+			//md_blocks += (blk_index % MD_BLOCKS_PER_PAGE);
+			md_blocks[blk_index].cache_state = INVALID;
+		}
+	}
+
+	spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, flags);
+
+	/*unmap bv_page*/
+	for (k = 0; k < set_block->mdbvec_count; k++) {
+		kunmap(set_block->mdblk_bvecs[k].bv_page);
+	}
+	//atomic_set(&set_block->holdcount, 1);
+	
+	region.bdev = dmc->cache_dev->bdev;
+	for (i = 0; i < set_block->mdbvec_count; i++) {
+		if (!sector_bits[i]) {
+			continue;
+		}
+		startbit = -1;
+		j = 0;
+		while (startbit == -1) {
+			if (sector_bits[i] & (1 << j))
+				startbit = j;
+			j++;
+		}
+		endbit = -1;
+		j = 7;
+		while (endbit == -1) {
+			if (sector_bits[i] & (1 << j))
+				endbit = j;
+			j--;
+		}
+		EIO_ASSERT(startbit <= endbit && startbit >= 0 && startbit <= 7 &&
+			   endbit >= 0 && endbit <= 7);
+		EIO_ASSERT(dmc->assoc != 128 || endbit <= 3);
+		region.sector =
+			dmc->md_start_sect + INDEX_TO_MD_SECTOR(start_index) +
+			i * SECTORS_PER_PAGE + startbit;
+		region.count = endbit - startbit + 1;
+		set_block->mdblk_bvecs[i].bv_offset = to_bytes(startbit);
+		set_block->mdblk_bvecs[i].bv_len = to_bytes(region.count);
+
+		EIO_ASSERT(region.sector <=
+			   (dmc->md_start_sect + INDEX_TO_MD_SECTOR(end_index)));
+		atomic64_inc(&dmc->eio_stats.md_ssd_writes);		
+		atomic64_inc(&dmc->eio_stats.seq_io_mdwrite);
+		SECTOR_STATS(dmc->eio_stats.ssd_writes, to_bytes(region.count));
+		//atomic_inc(&set_block->holdcount);
+		rw_flags = WRITE | REQ_SYNC;
+		error = eio_io_async_bvec(dmc, &region, rw_flags,
+					  &set_block->mdblk_bvecs[i], 1,
+					  NULL, set_block, 0);
+		
+		if (error) {
+			atomic64_inc(&dmc->eio_stats.seq_io_mdwrite_error);
+			dmc->eio_errors.ssd_write_errors++;
+			set_block->error = error;
+			pr_err("seq_io_md_update: write md error\n");
+			return error;
+		}
+	}
+
+	#if 0
+		/*if mdupdate succeed, update statistic*/
+		for (i = 0; i < set_block->block_nr; i++) {
+			blk_index = set_block->block_index[i];
+			set_index = set_block->set_index;
+			if (EIO_CACHE_STATE_GET(dmc, blk_index) == ALREADY_DIRTY) {
+				EIO_ASSERT(dmc->cache_sets[set].nr_dirty > 0);
+				dmc->cache_sets[set].nr_dirty--;
+				EIO_ASSERT(atomic64_read(&dmc->nr_dirty) > 0);
+				atomic64_dec(&dmc->nr_dirty);
+			}
+		}
+	#endif
+
+	return 0;
+}
+
+static void seq_io_callback(int error, void *context)
+{
+	struct kcached_job *job = (struct kcached_job *)context;
+	struct cache_c *dmc = job->dmc;
+
+	job->error = error;
+	INIT_WORK(&job->work, seq_io_post_callback);
+	queue_work(dmc->mdupdate_q, &job->work);
+	return;
+}
+
+static void seq_io_post_callback(struct work_struct *work)
+{
+	struct kcached_job *job;
+	struct cache_c *dmc;
+	struct bio_container *bc;	
+	struct eio_bio *ebio;
+	struct seqio_set_block *set_block;
+	index_t blk_index;
+	index_t set_index;
+	u_int8_t cache_state;
+	int error;
+	int ret;
+	int i;	
+	long elapsed;
+	unsigned long flags;
+	
+	job = container_of(work, struct kcached_job, work);
+	dmc = job->dmc;
+	ebio = job->ebio;
+	bc = ebio->eb_bc;
+	error = job->error;
+
+	EIO_DBG(INFO, dmc, "seq_io_post_callback called\n");
+	if (job->action != WRITEDISK) {
+		pr_err("seq_io_callback: invalid action\n");
+		return;
+	}
+	
+	if (error) {
+		dmc->eio_errors.disk_write_errors++;
+		pr_err("seq_io_callback:error:%d,block:%llu,action:%d", error,
+			(unsigned long long)job->job_io_regions.disk.sector, job->action);
+		/*TODO*/
+	} else if(bc->set_block) {
+		/*update on-disk metadata first*/
+		for (set_block = bc->set_block; set_block; set_block = set_block->next) {
+				
+			ret = seq_io_md_update(dmc, set_block);
+			if (ret) {
+				pr_err("seq_io_callback: md update error, set[%lu]\n", 
+							(long)set_block->set_index);
+				/*this bio return error*/
+				error = ret;
+				goto err_out;
+			}
+
+			set_index = set_block->set_index;
+			EIO_ASSERT(set_index >= 0);		
+			/*then update in-core metadata*/
+			spin_lock_irqsave(&dmc->cache_sets[set_index].cs_lock, flags);
+			for (i = 0; i < set_block->block_nr; i++) {
+				blk_index = set_block->block_index[i];
+				EIO_ASSERT(blk_index >= 0);
+				cache_state = EIO_CACHE_STATE_GET(dmc, blk_index);
+				if (cache_state == ALREADY_DIRTY) {
+					EIO_CACHE_STATE_SET(dmc, blk_index, INVALID);
+					EIO_ASSERT(dmc->cache_sets[set_index].nr_dirty > 0);
+					dmc->cache_sets[set_index].nr_dirty--;
+					EIO_ASSERT(atomic64_read(&dmc->nr_dirty) > 0);
+					atomic64_dec(&dmc->nr_dirty);
+					atomic64_dec_if_positive(&dmc->eio_stats.cached_blocks);
+				} else {
+					pr_err("seq_io_callback:this cann't happen!!!, cache_state:%u\n", cache_state);
+					EIO_ASSERT(0);
+				}
+				#if 0
+				} else {
+					if(!(cache_state & QUEUED)) {
+						EIO_CACHE_STATE_ON(dmc, blk_index, QUEUED);
+					}
+				}
+				#endif
+			}
+			spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, flags);
+		}
+	}
+
+err_out:
+
+	if (bc->set_block) {
+		/*release lock*/
+		#if 0
+		for (set_block = bc->set_block; 
+			set_block; set_block = set_block->next) {
+			up_write(&dmc->cache_sets[set_block->set_index].rw_lock);
+		}
+			#endif
+		/*free set_lock resource*/
+		seq_io_free_set_block(bc);
+	}
+	elapsed = (long)jiffies_to_msecs(jiffies - bc->bc_iotime);
+	EIO_DBG(INFO, dmc, "bio_comptime:%lu, bio_locktime:%lu, bio_rwtime:%lu\n",
+		elapsed, (long)jiffies_to_msecs(bc->bc_locktime - bc->bc_iotime),
+		(long)jiffies_to_msecs(jiffies - bc->bc_locktime));
+	/*calc io latency every 100IOs*/
+	atomic64_inc(&dmc->seq_io_count);
+	atomic64_add(elapsed, &dmc->seq_io_ms);
+	if (1000 == atomic64_read(&dmc->seq_io_count)) {
+		long io_ms = atomic64_read(&dmc->seq_io_ms);
+		long io_count = atomic64_read(&dmc->seq_io_count);	
+		EIO_DBG(INFO, dmc, "seq_io_ms:%lu, seq_io_count:%lu\n",io_ms, io_count);
+		dmc->eio_stats.seq_io_latency = EIO_DIV(io_ms, io_count);
+		atomic64_set(&dmc->seq_io_count, 0);
+		atomic64_set(&dmc->seq_io_ms, 0);
+	}
+	/*return bio*/	
+	eb_endio(ebio, error);
+	job->ebio = NULL;
+	eio_free_cache_job(job);
+}
+
+static void
+seq_io_disk_io(struct cache_c *dmc, struct bio_container *bc, struct bio *bio)
+{
+	struct eio_bio *ebio;
+	struct kcached_job *job;
+	//struct seqio_set_block *set_block;
+	int residual_biovec = 0;
+	int error = 0;
+
+	EIO_DBG(INFO, dmc, "seq_io_disk_io called\n");
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+	/*disk io happens on whole bio. Reset bi_iter.bi_idx*/
+	bio->bi_iter.bi_idx = 0;
+	ebio =
+		eio_new_ebio(dmc, bio, &residual_biovec, bio->bi_iter.bi_sector,
+				 bio->bi_iter.bi_size, bc, EB_MAIN_IO);
+#else 
+	/*disk io happens on whole bio. Reset bi_idx*/
+	bio->bi_idx = 0;
+	ebio =
+		eio_new_ebio(dmc, bio, &residual_biovec, bio->bi_sector,
+			     bio->bi_size, bc, EB_MAIN_IO);
+#endif 
+	if (unlikely(IS_ERR(ebio))) {
+		bc->bc_error = error = PTR_ERR(ebio);
+		ebio = NULL;
+		goto errout;
+	}
+	job = eio_new_job(dmc, ebio, -1);
+	if (unlikely(job == NULL)) {
+		error = -ENOMEM;
+		goto errout;
+	}
+	atomic_inc(&dmc->nr_jobs);
+	if (ebio->eb_dir == READ) {
+		job->action = READDISK;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+		SECTOR_STATS(dmc->eio_stats.disk_reads, bio->bi_iter.bi_size);
+#else 
+		SECTOR_STATS(dmc->eio_stats.disk_reads, bio->bi_size);
+#endif 
+		atomic64_inc(&dmc->eio_stats.readdisk);
+	} else {
+		job->action = WRITEDISK;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
+		SECTOR_STATS(dmc->eio_stats.disk_writes, bio->bi_iter.bi_size);
+#else 
+		SECTOR_STATS(dmc->eio_stats.disk_writes, bio->bi_size);
+#endif 
+		atomic64_inc(&dmc->eio_stats.writedisk);
+	}
+
+	/*
+	 * Pass the original bio flags as is, while doing
+	 * read / write to HDD.
+	 */
+	VERIFY_BIO_FLAGS(ebio);
+	error = eio_io_async_bvec(dmc, &job->job_io_regions.disk,
+				  GET_BIO_FLAGS(ebio),
+				  ebio->eb_bv, ebio->eb_nbvec,
+				  seq_io_callback, job, 1);
+
+	if (error) {
+		pr_err("seq_io_disk_io: disk write error\n");
+		job->ebio = NULL;
+		eio_free_cache_job(job);
+		goto errout;
+	}
+	return;
+
+errout:
+	if (bc) {
+		/*release lock and other resource*/
+		#if 0
+		set_block = bc->set_block;
+		while (set_block) {
+			EIO_VERIFY(set_block->set_index > 0);
+			up_write(&dmc->cache_sets[set_block->set_index].rw_lock);
+			set_block = set_block->next;
+		}
+		#endif
+		if (bc->set_block) {
+			seq_io_free_set_block(bc);
+		}
+	}
+	
+	if (ebio) {
+		eb_endio(ebio, error);
+	}
+	return;
+}
+
+void seq_io_remove_from_lru(struct seqio_hash_node *hash_node, 
+									   struct seqio_lru_node *lru_node)
+{
+	if (lru_node->prev != NULL) 
+		lru_node->prev->next = lru_node->next;
+	else {
+		EIO_VERIFY(hash_node->lru_node_head == lru_node);
+		hash_node->lru_node_head = lru_node->next;
+	}
+	if (lru_node->next != NULL)
+		lru_node->next->prev = lru_node->prev;
+	else {
+		EIO_VERIFY(hash_node->lru_node_tail == lru_node);
+		hash_node->lru_node_tail = lru_node->prev;
+	}
+}
+
+void seq_io_move_to_lruhead(struct seqio_hash_node *hash_node, 
+                                       struct seqio_lru_node *lru_node)
+{
+	//EIO_VERIFY(hash_node);
+	//EIO_VERIFY(lru_node);
+	if (likely(lru_node->prev != NULL || lru_node->next != NULL))
+		seq_io_remove_from_lru(hash_node, lru_node);
+	/* Add it to LRU head */
+	if (hash_node->lru_node_head != NULL)
+		hash_node->lru_node_head->prev = lru_node;
+	lru_node->next = hash_node->lru_node_head;
+	lru_node->prev = NULL;
+	hash_node->lru_node_head = lru_node;
+}
+
+int seq_io_move_to_hash_node(struct seqio_hash_node *old_hash_node, 
+							  struct seqio_hash_node *new_hash_node, 
+							  struct seqio_lru_node *lru_node)
+{
+	if (!old_hash_node || !new_hash_node || !lru_node) {
+		return -EINVAL;
+	}
+
+	/*Remove from old hash node*/
+	seq_io_remove_from_lru(old_hash_node, lru_node);
+
+	/*Clear prev and next*/
+	lru_node->next = NULL;
+	lru_node->prev = NULL;
+
+	/*Add to the head of new hash node*/
+	seq_io_move_to_lruhead(new_hash_node, lru_node);
+
+	return 0;
+}
+
+/*function to allocate resource for updating metadata*/
+static int seq_io_alloc_mdupdate_mem(struct bio_container *bc)
+{
+	struct seqio_set_block *curr;
+	unsigned int md_size, nr_bvecs;
+	int ret;
+
+	if (!bc || !bc->set_block) {
+		pr_err("seq_io_alloc_mdupdate_mem:bc or set_block null\n");
+		return -1;
+	}
+
+	for (curr = bc->set_block; curr; curr = curr->next) {
+		if (curr->set_index < 0 || curr->block_nr == 0) {
+			pr_err("seq_io_alloc_mdupdate_mem:invalid set_block\n");
+			seq_io_free_set_block(bc);
+			return -1;
+		}
+		/*alloc memory to update metadata*/
+		md_size = bc->bc_dmc->assoc * sizeof(struct flash_cacheblock);
+		nr_bvecs = IO_BVEC_COUNT(md_size, SECTORS_PER_PAGE);
+		curr->mdblk_bvecs = (struct bio_vec *)
+						kmalloc(sizeof(struct bio_vec) * nr_bvecs, GFP_KERNEL);
+		if(!curr->mdblk_bvecs) {
+			pr_err("seq_io_alloc_mdupdate_mem:alloc mdblk_bvecs failed\n");
+			seq_io_free_set_block(bc);
+			return -1;
+		}
+		ret = eio_alloc_wb_bvecs(curr->mdblk_bvecs,
+								nr_bvecs,
+								SECTORS_PER_PAGE);
+		if (ret) {
+			pr_err("seq_io_alloc_mdupdate_mem:alloc mdblk_bvecs page failed\n");
+			seq_io_free_set_block(bc);
+			return -1;
+		}
+		curr->mdbvec_count = nr_bvecs;
+		curr->bc = bc;		
+		bc->nr_set_block++;
+		//atomic_inc(&bc->nr_set_block);
+	}
+	return 0;
+}
+
+#if 0
+/*function to allocate resource for updating metadata*/
+static struct seqio_set_block * seq_io_get_set_block(struct bio_container *bc)
+{
+	struct seqio_set_block *set_block;
+	unsigned int md_size, nr_bvecs;
+	int ret;
+
+	if (!bc) {
+		pr_err("seq_io_get_set_block:bc is null\n");
+		return NULL;
+	}
+	set_block = kzalloc(sizeof(struct seqio_set_block), GFP_NOWAIT);
+	if (!set_block) {
+		pr_err("seq_io_get_set_block:alloc set_block failed\n");
+		seq_io_free_set_block(bc);
+		return NULL;
+	}
+	/*alloc memory to save dirty block index*/
+	set_block->dirty_blocks = kzalloc(sizeof(index_t) * bc->bc_dmc->assoc,
+										GFP_NOWAIT);
+	if (!set_block->dirty_blocks) {
+		pr_err("seq_io_get_set_block:alloc dirty_blocks failed\n");
+		seq_io_free_set_block(bc);
+		return NULL;
+	}
+	
+	/*alloc memory to update metadata*/
+	md_size = bc->bc_dmc->assoc * sizeof(struct flash_cacheblock);
+	nr_bvecs = IO_BVEC_COUNT(md_size,SECTORS_PER_PAGE);
+	set_block->mdblk_bvecs = (struct bio_vec *)
+					kmalloc(sizeof(struct bio_vec) * nr_bvecs,
+						GFP_KERNEL);
+	if(!set_block->mdblk_bvecs) {
+		pr_err("seq_io_get_set_block:alloc mdblk_bvecs failed\n");
+		seq_io_free_set_block(bc);
+		return NULL;
+	}
+	ret = eio_alloc_wb_bvecs(set_block->mdblk_bvecs,
+							nr_bvecs,
+							SECTORS_PER_PAGE);
+	if (ret) {
+		pr_err("seq_io_get_set_block:alloc mdblk_bvecs page failed\n");
+		seq_io_free_set_block(bc);
+		return NULL;
+	}
+	set_block->mdbvec_count = nr_bvecs;
+	set_block->bc = bc;
+	atomic_inc(&bc->nr_set_block);
+	
+	return set_block;
+}
+static void seq_io_free_mdupdate_mem(struct bio_container *bc)
+{
+	struct seqio_set_block *curr;
+
+	if (!bc) {
+		pr_err("bc null!!!")
+		return;
+	}
+	for (curr = bc->set_block; curr; curr = curr->next) {
+		if (curr->mdblk_bvecs) {
+			eio_free_wb_bvecs(curr->mdblk_bvecs, curr->mdbvec_count,
+							SECTORS_PER_PAGE);
+			kfree(curr->mdblk_bvecs);
+		}
+		kfree(curr);
+	}
+	bc->set_block = NULL;
+}
+#endif
+static void seq_io_free_set_block(struct bio_container *bc)
+{
+	struct seqio_set_block *curr;
+	struct seqio_set_block *next;
+	struct cache_c *dmc;
+	index_t set_index;
+	unsigned long flags;
+
+	if (!bc) {
+		pr_err("bc null!!!");
+		return;
+	}
+	dmc = bc->bc_dmc;	
+	EIO_VERIFY(dmc);
+	curr = bc->set_block;	
+	while (curr) {
+		next = curr->next;
+		if (curr->mdblk_bvecs) {
+			eio_free_wb_bvecs(curr->mdblk_bvecs,
+					  curr->mdbvec_count,
+					  SECTORS_PER_PAGE);
+			kfree(curr->mdblk_bvecs);
+			curr->mdblk_bvecs = NULL;
+		}		
+		set_index = curr->set_index;
+		EIO_VERIFY(set_index >= 0);
+		/*clear flag */
+		spin_lock_irqsave(&dmc->cache_sets[set_index].cs_lock, flags);
+		dmc->cache_sets[set_index].flags &= ~SETFLAG_SKIP_SEQUENTIAL_IO;
+		spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, flags);
+		kfree(curr);
+		curr = next;
+	}
+	#if 0
+	for (curr = bc->set_block; curr; curr = curr->next) {
+		/*free bvec*/
+		if (curr->mdblk_bvecs) {
+			EIO_ASSERT(curr->mdbvec_count == 1);
+			eio_free_wb_bvecs(curr->mdblk_bvecs, curr->mdbvec_count,
+							SECTORS_PER_PAGE);
+			kfree(curr->mdblk_bvecs);
+			curr->mdblk_bvecs = NULL;
+		}
+		set_index = curr->set_index;
+		EIO_VERIFY(set_index >= 0);
+		/*clear flag */
+		spin_lock_irqsave(&dmc->cache_sets[set_index].cs_lock, flags);
+		dmc->cache_sets[set_index].flags &= ~SETFLAG_SKIP_SEQUENTIAL_IO;
+		spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, flags);
+		kfree(curr);
+	}
+	#endif
+	bc->set_block = NULL;
+}
+#if 0
+static void seq_io_free_set_block(struct bio_container *bc)
+{
+	struct seqio_set_block *set_block;
+
+	if (!bc) {
+		return;
+	}
+	
+	for (set_block = bc->set_block; set_block; set_block = set_block->next) {
+		if (set_block->dirty_blocks) {
+			kfree(set_block->dirty_blocks);
+		}
+		if (set_block->mdblk_bvecs) {
+			eio_free_wb_bvecs(set_block->mdblk_bvecs,
+								  set_block->mdbvec_count,
+								  SECTORS_PER_PAGE);
+			kfree(set_block->mdblk_bvecs);
+		}
+		kfree(set_block);
+	}
+	bc->set_block = NULL;
+}
+#endif
+static int seq_io_inval_bio_range(struct cache_c *dmc, 
+										struct bio_container *bc)
+{
+	sector_t snum = bc->bc_bio->bi_sector;
+	unsigned iosize = bc->bc_bio->bi_size;
+	sector_t snext;
+	unsigned ioinset;
+	unsigned long cs_lock_flags;	
+	int totalsshift = dmc->block_shift + dmc->consecutive_shift;
+
+	index_t set_index, start_index, end_index, i;
+	sector_t endsector = snum + eio_to_sector(iosize);
+
+	struct seqio_set_block *new_set_block = NULL;	
+	struct seqio_set_block *curr = NULL;
+	//struct seqio_set_block *next = NULL;
+	struct seqio_set_block *prev = NULL;
+	
+	//unsigned long before_lock;
+	//unsigned long after_lock;
+
+	int skip_seqio = 1;
+	int ret;
+
+	while (iosize) {
+		/*get set number*/
+		set_index = hash_block(dmc, snum);
+		snext = ((snum >> totalsshift) + 1) << totalsshift;
+		ioinset = (unsigned)to_bytes(snext - snum);
+		/*test if this bio span 2 sets*/
+		if (ioinset > iosize)
+			ioinset = iosize;
+		
+		EIO_DBG(INFO, dmc, "wssc_inval_seqential_io_range:get lock\n");
+		spin_lock_irqsave(&dmc->cache_sets[set_index].cs_lock, cs_lock_flags);
+
+		#if 0
+		/*Test if this dirty set is flushing...*/
+		if(dmc->cache_sets[set_index].flags & SETFLAG_CLEAN_INPROG) { 						
+			skip_seqio = 0;
+			atomic64_inc(&dmc->eio_stats.seq_io_flushing);
+			goto out;
+		}
+		#endif
+		
+		start_index = dmc->assoc * set_index;
+		end_index = start_index + dmc->assoc;
+
+		/*traverse all cache block in the set*/
+		for (i = start_index; i < end_index; i++) {			
+			sector_t start_dbn;
+			sector_t end_dbn;
+			u_int8_t cache_state;
+
+			cache_state = EIO_CACHE_STATE_GET(dmc, i);
+			
+			if (cache_state & INVALID) {
+				atomic64_inc(&dmc->eio_stats.seq_io_invalid);
+				continue;
+			}
+			
+			start_dbn = EIO_DBN_GET(dmc, i);
+			end_dbn = start_dbn + dmc->block_size;
+
+			if (!(endsector <= start_dbn || snum >= end_dbn)) {
+				/*invalidate VALID block*/
+				if (cache_state == VALID) {	
+					EIO_DBG(INFO, dmc, "wssc_inval_seqential_io_range:"
+					 	"valid block %lu\n", (long)i);
+					EIO_CACHE_STATE_SET(dmc, i, INVALID);
+					atomic64_dec_if_positive(&dmc->eio_stats.cached_blocks);
+					atomic64_inc(&dmc->eio_stats.seq_io_valid);
+				/*invalidate ALREADY_DIRTY block*/
+				} else if (cache_state == ALREADY_DIRTY) {
+					/*check if this bio contain this dirty block completely*/
+					if (start_dbn >= snum && end_dbn <= endsector) {
+
+						/*Test if this dirty set is being flush...*/
+						if(dmc->cache_sets[set_index].flags & 
+							SETFLAG_CLEAN_INPROG) {							
+							skip_seqio = 0;
+							atomic64_inc(&dmc->eio_stats.seq_io_flushing);
+							goto out;
+						}
+
+						/*Add flag to set*/
+						dmc->cache_sets[set_index].flags |= 
+							SETFLAG_SKIP_SEQUENTIAL_IO;
+						
+						/*alloc new_set_block*/
+						if (!new_set_block) {
+							/*before alloc memory, release spin lock*/
+							spin_unlock_irqrestore(
+								&dmc->cache_sets[set_index].cs_lock, 
+									cs_lock_flags);
+							//new_set_block = seq_io_get_set_block(bc);
+							new_set_block = 
+								kzalloc(sizeof(struct seqio_set_block),
+								GFP_KERNEL);
+							spin_lock_irqsave(
+								&dmc->cache_sets[set_index].cs_lock, 
+									cs_lock_flags);
+							if (!new_set_block ) {
+								skip_seqio = 0;
+								goto out;
+							}	
+				
+							new_set_block->set_index = set_index;
+							new_set_block->bc = NULL;
+							new_set_block->mdbvec_count = 0;
+							new_set_block->mdblk_bvecs = NULL;
+							new_set_block->next = NULL;
+							
+							/*insert new_set_block to set_block list*/
+							if (bc->set_block) {
+								curr = bc->set_block;
+								prev = NULL;
+								while (curr) {
+									prev = curr;
+									curr = curr->next;
+								}
+								prev->next = new_set_block;
+							} else {
+								bc->set_block = new_set_block;
+							}
+						}
+				
+						/*get dirty cache block index in this cache set*/						
+						new_set_block->block_index[new_set_block->block_nr] = i ;	
+						new_set_block->block_nr++;
+						atomic64_inc(&dmc->eio_stats.seq_io_dirty);
+					} else {
+						/*this dirty block is just part of this bio*/
+						skip_seqio = 0;
+						atomic64_inc(&dmc->eio_stats.seq_io_partdirty);
+						goto out;
+					}
+				} else if (!(cache_state & DIRTY )) {
+					/*
+						1.VALID | CACHEWRITEINPROG
+						a.when cached write,->DIRTY_INPROG->ALREADY_DIRTY
+						b.when uncached write,->VALID | CACHEWRITEINPROG | DISKWRITEINPROG ->
+						                    VALID | DISKWRITEINPROG -> VALID
+						c.when read fill,->VALID
+
+						when we found a cache block with this state,do not add QUEUED to it,
+						and we can not skip this bio
+						
+						2.VALID | CACHEWRITEINPROG | DISKWRITEINPROG
+						a.when uncache write-> VALID | DISKWRITEINPROG -> VALID
+						3.VALID | CACHEREADINPROG
+						a.when cached read, -> VALID
+						b.when uncached read,-> VALID
+						4.VALID | DISKWRITEINPROG
+						a.when uncache write,-> VALID
+						5.VALID | DISKREADINPROG
+						a.when uncache read and read fill,->VALID | CACHEWRITEINPROG -> VALID
+						when we found a cache block with these states,we can add QUEUED on it
+
+					*/
+					EIO_DBG(INFO, dmc, "wssc_inval_seqential_io_range:"
+					 	"queue block %lu\n", (long)i);					
+					if(!(cache_state & QUEUED)) {
+						/*no QUEUED flag*/
+						if (cache_state == (VALID | CACHEWRITEINPROG)) {							
+							atomic64_inc(&dmc->eio_stats.seq_io_ioinp_cw);
+							skip_seqio = 0;
+							goto out;
+						}
+						EIO_CACHE_STATE_ON(dmc, i, QUEUED);
+					}
+					atomic64_inc(&dmc->eio_stats.seq_io_ioinp);
+				/*if cache block is DIRTY_INPROG or CLEAN_INPROG, do not skip seq io*/
+				} else if (cache_state == DIRTY_INPROG || 
+							cache_state == CLEAN_INPROG) {
+					skip_seqio = 0;
+					if (cache_state == DIRTY_INPROG) {
+						atomic64_inc(&dmc->eio_stats.seq_io_dirtyinp);
+					} else {
+						atomic64_inc(&dmc->eio_stats.seq_io_cleaninp);
+					}
+					goto out;					
+				} else {
+					pr_err("wssc_inval_seqential_io_range:unkown cache stat:%x!!!\n", 
+						cache_state);
+					skip_seqio = 0;
+					goto out;					
+				}
+			}
+		}
+
+		new_set_block = NULL;
+		spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, cs_lock_flags);
+		EIO_DBG(INFO, dmc, "wssc_inval_seqential_io_range:release lock\n");
+
+		/*next set*/
+		snum = snext;
+		iosize -= ioinset;
+	}
+
+out:
+	if(0 == skip_seqio) {
+		spin_unlock_irqrestore(&dmc->cache_sets[set_index].cs_lock, cs_lock_flags);
+		/*if skip_seqio=0, release resource*/
+		if (bc->set_block) {
+			seq_io_free_set_block(bc);
+		}
+	} else {
+		/*skip_seqio confirm, alloc memory to update metadate, and get rw lock*/		
+		if (bc->set_block) {
+			ret = seq_io_alloc_mdupdate_mem(bc);
+			if (0 != ret) {
+				pr_err("seq_io_inval_bio_range:alloc mdupdate mem failed\n");
+				//seq_io_free_set_block(bc);
+				skip_seqio = 0;
+				#if 0
+				curr = bc->set_block;
+				while (curr) {
+					EIO_VERIFY(curr->set_index >= 0);
+					/*TODO:maybe deadlock with eio_acquire_set_locks()*/
+					before_lock = jiffies;
+					down_write(&dmc->cache_sets[curr->set_index].rw_lock);
+					after_lock = jiffies;
+					EIO_DBG(ERROR, dmc, "------set[%u] get write lock:%u ms,bio size:%u------,", 
+						(unsigned int)curr->set_index, 
+						jiffies_to_msecs(after_lock - before_lock), 
+						TO_KB(bc->bc_bio->bi_size));
+					curr = curr->next;
+				}
+				EIO_DBG(ERROR, dmc, "---\n");
+				bc->bc_locktime = jiffies;
+				#endif
+			}
+		}
+	}
+	
+	return skip_seqio;
+}
+
+/*function to update io prediction info*/
+static int 
+seq_io_update_iopredict(struct cache_c *dmc, int sequential, 
+						struct seqio_lru_node *lru_node, struct bio *bio)
+{	
+	EIO_ASSERT(dmc);
+	EIO_ASSERT(lru_node);
+	EIO_ASSERT(bio);
+
+#if 0
+	/*1.Update io count info*/
+	if (lru_node->bypass_flag) {
+		/*the sequential size already reachs seqio_threshold_bypass_kb*/
+		dmc->io_predict.bypass_io_count++;
+		dmc->io_predict.threshold_io_count++;
+	} else if (lru_node->threshold_flag) {
+		/*the sequential size reachs seqio_low_threshold_kb*/
+		dmc->io_predict.threshold_io_count++;
+		if (TO_KB(lru_node->sequential_size_bytes) >= 
+									dmc->seqio_threshold_bypass_kb) {
+			lru_node->bypass_flag = 1;
+			dmc->io_predict.bypass_io_count += lru_node->io_count;
+		}
+	} else {
+		/*the IO is sequential, check the sequential size*/
+		if (TO_KB(lru_node->sequential_size_bytes) >= 
+				dmc->sysctl_active.seqio_threshold_len_kb) {
+			lru_node->threshold_flag = 1;
+			//dmc->io_predict.threshold_io_count += lru_node->io_count;
+			dmc->io_predict.threshold_io_count++;
+			if (TO_KB(lru_node->sequential_size_bytes) >=	
+										dmc->seqio_threshold_bypass_kb) {
+				lru_node->bypass_flag = 1;
+				//dmc->io_predict.bypass_io_count += lru_node->io_count;
+				dmc->io_predict.bypass_io_count++;
+			}
+		}
+	}
+#endif
+
+	if (!lru_node->threshold_flag) {
+		/*the IO is sequential, check the sequential size*/
+		if (TO_KB(lru_node->sequential_size_bytes) >= 
+				dmc->sysctl_active.seqio_threshold_len_kb) {
+			lru_node->threshold_flag = 1;
+			dmc->io_predict.threshold_io_count++;
+			if (TO_KB(lru_node->sequential_size_bytes) >=	
+								dmc->seqio_threshold_bypass_kb) {
+				lru_node->bypass_flag = 1;
+				dmc->io_predict.bypass_io_count++;
+			}
+		}
+	} else if (lru_node->threshold_flag && !lru_node->bypass_flag) {
+		if (TO_KB(lru_node->sequential_size_bytes) >= 
+					dmc->seqio_threshold_bypass_kb) {
+			lru_node->bypass_flag = 1;
+			dmc->io_predict.bypass_io_count++;
+		}
+	} else {
+		/*do nothing*/
+	}
+	
+	/*2.Update percent*/
+	if (time_after(jiffies, 
+			dmc->io_predict.calc_time + SEQIO_UPDATE_PCT_INTERVAL) &&
+			dmc->io_predict.threshold_io_count >= SEQIO_UPDATE_PCT_COUNT) {
+		unsigned int percent;
+ 		percent = EIO_CALCULATE_PERCENTAGE(
+				dmc->io_predict.bypass_io_count,
+				dmc->io_predict.threshold_io_count);
+		dmc->io_predict.skip = 
+			(percent >= SEQIO_SKIP_PCT_THRESHOLD) ? (int)1 : (int)0;
+		EIO_DBG(ERROR, dmc, "threshold_io_count:%u, bypass_io_count:%u"
+			",percent:%u\n", dmc->io_predict.threshold_io_count, 
+		dmc->io_predict.bypass_io_count, percent);
+		/*clear io count*/
+		dmc->io_predict.bypass_io_count = 0;
+		dmc->io_predict.threshold_io_count = 0;
+		dmc->io_predict.calc_time = jiffies;
+	}
+
+	/*3.Determine skip this IO or not*/
+	if (TO_KB(bio->bi_size) >= dmc->sysctl_active.seqio_threshold_len_kb) {
+//	if (TO_KB(bio->bi_size) >= SEQIO_SINGLE_IO_BYPASS_LEN_KB) {
+		/*a single IO,and its length reachs seqio_bypass_len_kb, 
+		just skip this IO, ignore the value of io_predict.skip,
+		I found that the largest bio size is 128KB*/
+		atomic64_inc(&dmc->eio_stats.seq_singleio_count);
+		return 1;
+	}
+	#if 0
+	if (!sequential && 
+			(TO_KB(bio->bi_size) >= dmc->sysctl_active.seqio_bypass_len_kb)) {
+		/*a single IO,and its length reachs seqio_bypass_len_kb, 
+		just skip this IO, ignore the value of io_predict.skip*/
+		return 1;
+	}
+	#endif
+
+	if (dmc->io_predict.skip && lru_node->threshold_flag) {
+		return 1;
+	}
+	
+	return 0;
+}
+
+/*function to detect sequential io*/
+static int 
+seq_io_detect_seqential_io(struct cache_c *dmc, struct bio *bio)
+{
+	//u_int32_t hash_node_idx;
+	//u_int32_t new_hash_node_idx;
+	struct seqio_hash_node *hash_node;
+	//struct seqio_hash_node *new_hash_node;
+	struct seqio_lru_node *lru_node;
+	int sequential = 0;
+
+	/*check threshold*/
+	//if (0 == dmc->sysctl_active.seqio_threshold_len_kb) {
+	//	EIO_DBG(INFO, dmc, "seqio_threshold_len_kb 0\n");
+	//	return 0;
+	//}
+	
+	/*1.Get hash node*/
+	//hash_node_idx = to_bytes(bio->bi_sector) >> SEQIO_HAZE_SIZE_1GB_SHIFT;
+	//hash_node_idx %= (SEQIO_HASH_TBL_SIZE - 1);
+ 	//hash_node = &dmc->seqio_hashtbl[hash_node_idx];
+	//EIO_VERIFY(hash_node);	
+ 	hash_node = &dmc->seqio;
+	/*2.Scan the LRU list*/
+	for (lru_node = hash_node->lru_node_head; 
+			lru_node != NULL; lru_node = lru_node->next) {
+		EIO_VERIFY(lru_node);
+		/*Write the same sector*/
+		if (lru_node->most_recent_sector == bio->bi_sector) {
+			EIO_DBG(INFO, dmc, "write the same sector\n");
+			sequential = 1;
+			if (bio->bi_size > lru_node->last_bio_size) {				
+				lru_node->sequential_size_bytes += 
+						(bio->bi_size - lru_node->last_bio_size);
+				lru_node->last_bio_size = bio->bi_size;
+				lru_node->io_count++;
+				EIO_DBG(INFO, dmc, "id:%lu, io_count:%lu, sequential_size_bytes:%lu\n", 
+						lru_node->node_id, lru_node->io_count, 
+							TO_KB(lru_node->sequential_size_bytes));
+			}			
+		}		
+		/*This IO is sequential*/
+		else if (bio->bi_sector == 
+		  	(lru_node->most_recent_sector + eio_to_sector(lru_node->last_bio_size))) {				
+			EIO_DBG(INFO, dmc, "sequential io found\n");
+			lru_node->most_recent_sector = bio->bi_sector;
+			lru_node->last_bio_size = bio->bi_size;
+			lru_node->sequential_size_bytes += bio->bi_size;
+			lru_node->io_count++;
+			sequential = 1;
+			EIO_DBG(INFO, dmc, "id:%lu, io_count:%lu, sequential_size_bytes:%lu\n", 
+					lru_node->node_id, lru_node->io_count, 
+					TO_KB(lru_node->sequential_size_bytes));
+		}
+
+		if (sequential) {break;}
+	}
+
+	/*3.Non-seqential IO, get a new lru_node from tail*/
+	if (!sequential) {
+		EIO_DBG(INFO, dmc, "not a sequential io\n");
+		//lru_node = hash_node->lru_node_tail;
+		lru_node = hash_node->lru_node_tail;
+		EIO_VERIFY(lru_node);
+		/*Replace the last lru node with this bio*/
+		lru_node->most_recent_sector = bio->bi_sector;
+		lru_node->last_bio_size = bio->bi_size;
+		lru_node->sequential_size_bytes = bio->bi_size;
+		lru_node->node_id = dmc->node_id;
+		lru_node->io_count = 1;	
+		lru_node->threshold_flag = 0;
+		lru_node->bypass_flag = 0;
+		dmc->node_id++;
+		EIO_DBG(INFO, dmc, "id:%lu, io_count:%lu, sequential_size_bytes:%lu\n", 
+				lru_node->node_id, lru_node->io_count, 
+				TO_KB(lru_node->sequential_size_bytes));
+	}
+
+	if (lru_node != hash_node->lru_node_head) {
+		EIO_DBG(INFO, dmc, "wssc_detect_seqential_io: move to lru head\n");
+		seq_io_move_to_lruhead(hash_node, lru_node);
+	}
+
+#if 0
+	/*4.Check if it needs to move hash node*/	
+	new_hash_node_idx = (to_bytes(bio->bi_sector) + bio->bi_size) 
+							>> SEQIO_HAZE_SIZE_1GB_SHIFT;
+	new_hash_node_idx %= (SEQIO_HASH_TBL_SIZE - 1);
+	if (new_hash_node_idx != hash_node_idx) {
+		/*Move this lru_node to new hash node*/
+		EIO_DBG(INFO, dmc, "wssc_detect_seqential_io: move to new hash node\n");
+		EIO_VERIFY(new_hash_node_idx == 
+				(hash_node_idx + 1) % (SEQIO_HASH_TBL_SIZE - 1));
+		new_hash_node = &dmc->seqio_hashtbl[new_hash_node_idx];
+		seq_io_move_to_hash_node(hash_node, new_hash_node, lru_node);
+	} else {
+		/*Move to the head of the current hash node if needed*/
+		if (lru_node != hash_node->lru_node_head) {
+			EIO_DBG(INFO, dmc, "wssc_detect_seqential_io: move to lru head\n");
+			seq_io_move_to_lruhead(hash_node, lru_node);
+		}
+	}
+#endif
+	/*5.Update IO predict info*/
+	 return seq_io_update_iopredict(dmc, sequential, lru_node, bio);
+}
+#endif

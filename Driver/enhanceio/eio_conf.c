@@ -1668,13 +1668,15 @@ int eio_cache_create(struct cache_rec_short *cache)
 	struct cache_c **nodepp;
 	unsigned int consecutive_blocks;
 	u_int64_t i;
+	int k;
 	index_t prev_set;
 	index_t cur_set;
 	sector_t order;
 	int error = -EINVAL;
 	uint32_t persistence = 0;
 	fmode_t mode = (FMODE_READ | FMODE_WRITE);
-	char *strerr = NULL;
+	char *strerr = NULL;	
+	struct seqio_hash_node *tmp_node;
 
 	dmc = kzalloc(sizeof(*dmc), GFP_KERNEL);
 	if (dmc == NULL) {
@@ -1996,12 +1998,62 @@ init:
 	dmc->sysctl_active.enable_sort_flush = ENABLE_SORT_FLUSH;
 	/*dbg ctl*/
 	dmc->log_level = EIO_LOG_LEVEL_OFF;
-	
-	/*fix issues 2253*/
-	spin_lock_init(&dmc->bc_free_lock);
-	spin_lock_init(&dmc->bc_id_lock);
-	init_rwsem(&dmc->muti_set_op_protect);
-	dmc->bc_id = 1;
+
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+   /*init sequential io */
+#if 0
+	for (j = 0; j < SEQIO_HASH_TBL_SIZE; j++) {
+		struct seqio_hash_node *tmp_node = &dmc->seqio_hashtbl[j];
+		
+		for (k = 0; k < SEQIO_TRACKER_QUEUE_DEPTH; k++) {
+			tmp_node->lru_nodes[k].most_recent_sector = 0;
+			tmp_node->lru_nodes[k].last_bio_size = 0;
+			tmp_node->lru_nodes[k].sequential_size_bytes = 0;
+			tmp_node->lru_nodes[k].node_id = 0;
+			tmp_node->lru_nodes[k].io_count = 0;
+			tmp_node->lru_nodes[k].threshold_flag = 0;
+			tmp_node->lru_nodes[k].bypass_flag = 0;
+			tmp_node->lru_nodes[k].prev = NULL;
+			tmp_node->lru_nodes[k].next = NULL;
+			seq_io_move_to_lruhead(tmp_node, &tmp_node->lru_nodes[k]);
+		}
+		tmp_node->lru_node_tail = &tmp_node->lru_nodes[0];
+	}
+#endif
+
+	tmp_node = &dmc->seqio;
+	for (k = 0; k < SEQIO_TRACKER_QUEUE_DEPTH; k++) {
+		tmp_node->lru_nodes[k].most_recent_sector = 0;
+		tmp_node->lru_nodes[k].last_bio_size = 0;
+		tmp_node->lru_nodes[k].sequential_size_bytes = 0;
+		tmp_node->lru_nodes[k].node_id = 0;
+		tmp_node->lru_nodes[k].io_count = 0;
+		tmp_node->lru_nodes[k].threshold_flag = 0;
+		tmp_node->lru_nodes[k].bypass_flag = 0;
+		tmp_node->lru_nodes[k].prev = NULL;
+		tmp_node->lru_nodes[k].next = NULL;
+		seq_io_move_to_lruhead(tmp_node, &tmp_node->lru_nodes[k]);
+	}
+	tmp_node->lru_node_tail = &tmp_node->lru_nodes[0];
+
+	spin_lock_init(&dmc->seq_io_lock);
+	//spin_lock_init(&dmc->wr_ioc_lock);
+	dmc->sysctl_active.seqio_threshold_len_kb = SEQIO_THRESHOLD_LEN_KB;	
+	dmc->sysctl_active.seqio_bypass_len_kb = SEQIO_BYPASS_LEN_KB;	
+	dmc->node_id = 1;
+	dmc->seqio_threshold_bypass_kb = 
+		dmc->sysctl_active.seqio_threshold_len_kb +
+		dmc->sysctl_active.seqio_bypass_len_kb;
+	//dmc->seqio_rbroot = RB_ROOT;
+	//dmc->rbnode_count = 0;
+	//spin_lock_init(dmc->seqio_rbtree_lock);
+	pr_err("seqio_threshold_len_kb:%u, seqio_bypass_len_kb:%u, seqio_threshold_bypass_kb:%u\n", 
+	dmc->sysctl_active.seqio_threshold_len_kb, dmc->sysctl_active.seqio_bypass_len_kb,
+	dmc->seqio_threshold_bypass_kb);
+	dmc->pct_update_time = jiffies;
+	dmc->io_predict.calc_time = jiffies;
+	dmc->detect_flag = 0;
+#endif
 
 	order = (dmc->size >> dmc->consecutive_shift) *
 		sizeof(struct cache_set);
@@ -2545,6 +2597,7 @@ int eio_allocate_wb_resources(struct cache_c *dmc)
 	INIT_DELAYED_WORK(&dmc->low_pressure_clean_work, eio_clean_low_io_pressure);
 	dmc->set_dirty_sort = kmalloc(sizeof(struct set_nr_dirty_pair) * \
 						SORT_SET_NR, GFP_KERNEL);
+	//dmc->set_dirty_sort = vmalloc(sizeof(struct set_nr_dirty_pair) * SORT_SET_NR);
 	if (NULL == dmc->set_dirty_sort) {
 		pr_err("cache_create: Failed to allocated memory set_dirty_sort.\n");
 		ret = -ENOMEM;	
@@ -2621,6 +2674,7 @@ err7:
 err6:
 #ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
 	if (dmc->set_dirty_sort ) {
+		//vfree((void *)dmc->set_dirty_sort);
 		kfree(dmc->set_dirty_sort);
 		dmc->set_dirty_sort = NULL;
 	}
@@ -2690,7 +2744,8 @@ void eio_free_wb_resources(struct cache_c *dmc)
 	
 #ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
 		if (dmc->set_dirty_sort ) {
-			kfree(dmc->set_dirty_sort);
+			//vfree((void *)dmc->set_dirty_sort);			
+			kfree((void *)dmc->set_dirty_sort);
 			dmc->set_dirty_sort = NULL;
 		}
 #endif

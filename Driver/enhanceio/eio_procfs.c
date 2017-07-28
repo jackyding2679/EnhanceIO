@@ -1151,6 +1151,58 @@ low_io_pressure_dirty_threshold_sysctl(struct ctl_table *table, int write,
 }
 #endif
 
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+static int 
+seqio_skip_threshold_sysctl(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos)
+{
+	struct cache_c *dmc = (struct cache_c *)table->extra1;
+	unsigned long flags = 0;
+
+	/* fetch the new tunable value or post existing value */
+
+	if (!write) {
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_pending.seqio_threshold_len_kb =
+			dmc->sysctl_active.seqio_threshold_len_kb;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	proc_dointvec(table, write, buffer, length, ppos);
+
+	/* do write processing */
+
+	if (write) {
+		/* do sanity check */
+		if (dmc->mode != CACHE_MODE_WB) {
+			pr_err
+				("seqio_threshold_len_kb is valid only for writeback cache");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.seqio_threshold_len_kb < 0) {
+			pr_err("seqio_threshold_len_kb is invalid");
+			return -EINVAL;
+		}
+
+		if (dmc->sysctl_pending.seqio_threshold_len_kb ==
+			dmc->sysctl_active.seqio_threshold_len_kb)
+			/* new is same as old value. No need to take any action */
+			return 0;
+
+		/* update the active value with the new tunable value */
+		spin_lock_irqsave(&dmc->cache_spin_lock, flags);
+		dmc->sysctl_active.seqio_threshold_len_kb =
+			dmc->sysctl_pending.seqio_threshold_len_kb;
+		spin_unlock_irqrestore(&dmc->cache_spin_lock, flags);
+	}
+
+	return 0;
+}
+
+#endif
+
 #ifdef ENABLE_TIME_BASED_CLEAN
 static int
 enable_time_based_clean_sysctl(struct ctl_table *table, int write,
@@ -1503,7 +1555,7 @@ static struct sysctl_table_common {
 	},
 };
 
-#define NUM_WRITEBACK_SYSCTLS   9 + LOW_IO_PRESSURE_SYSCTL_NR
+#define NUM_WRITEBACK_SYSCTLS   9 + LOW_IO_PRESSURE_SYSCTL_NR + SEQIO_SYSCTL_NR
 
 static struct sysctl_table_writeback {
 	struct ctl_table_header *sysctl_header;
@@ -1596,7 +1648,15 @@ static struct sysctl_table_writeback {
 			.maxlen 	= sizeof(int),
 			.mode		= 0644,
 			.proc_handler	= &eio_enable_aged_clean_sysctl,
-		},
+		},	
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+		{	/* 15 */
+			.procname	= "seqio_threshold_len_kb",
+			.maxlen 	= sizeof(int),
+			.mode		= 0644,
+			.proc_handler	= &seqio_skip_threshold_sysctl,
+		},	
+#endif	
 	}
 	, .dev = {
 		{
@@ -1887,23 +1947,34 @@ static void *eio_find_sysctl_data(struct cache_c *dmc, struct ctl_table *vars)
 		return (void *)&dmc->sysctl_pending.invalidate;
 
 #ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
-	if (strcmp(vars->procname, "enable_low_io_pressure_clean") == 0)
+	if (strcmp(vars->procname, "enable_low_io_pressure_clean") == 0) {
 		return (void *)&dmc->sysctl_pending.enable_low_io_pressure_clean;
-	if (strcmp(vars->procname, "low_io_pressure_threshold") == 0)
+	}
+	if (strcmp(vars->procname, "low_io_pressure_threshold") == 0) {
 		return (void *)&dmc->sysctl_pending.low_io_pressure_threshold;
-	if (strcmp(vars->procname, "low_io_pressure_latency") == 0)
+	}
+	if (strcmp(vars->procname, "low_io_pressure_latency") == 0) {
 		return (void *)&dmc->sysctl_pending.low_io_pressure_latency;
-	if (strcmp(vars->procname, "low_io_pressure_clean_set_nr") == 0)
+	}
+	if (strcmp(vars->procname, "low_io_pressure_clean_set_nr") == 0) {
 		return (void *)&dmc->sysctl_pending.low_io_pressure_clean_set_nr;
-	if (strcmp(vars->procname, "low_io_pressure_dirty_threshold") == 0)
+	}
+	if (strcmp(vars->procname, "low_io_pressure_dirty_threshold") == 0) {
 		return (void *)&dmc->sysctl_pending.low_io_pressure_dirty_threshold;
+	}
 #endif
-	if (strcmp(vars->procname, "enable_aged_clean") == 0)
+	if (strcmp(vars->procname, "enable_aged_clean") == 0) {
 		return (void *)&dmc->sysctl_pending.enable_aged_clean;
+	}
 	if (strcmp(vars->procname, "enable_sort_flush") == 0)
 		return (void *)&dmc->sysctl_pending.enable_sort_flush;
-
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+	if (strcmp(vars->procname, "seqio_threshold_len_kb") == 0) {
+		return (void *)&dmc->sysctl_pending.seqio_threshold_len_kb;
+	}
+#endif
 	pr_err("Cannot find sysctl data for %s", vars->procname);
+
 	return NULL;
 }
 
@@ -2284,6 +2355,41 @@ static int eio_stats_show(struct seq_file *seq, void *v)
 		    (int64_t)atomic64_read(&dmc->nr_ios));
 	seq_printf(seq, "%-26s %12lld\n", "clean_pendings",
 		    (int64_t)atomic64_read(&dmc->clean_pendings));
+
+	
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_write_count",
+		    (int64_t)atomic64_read(&stats->seq_io_write_count));
+	seq_printf(seq, "%-26s %12lld\n", "seq_singleio_count",
+		    (int64_t)atomic64_read(&stats->seq_singleio_count));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_write_size",
+		    (int64_t)atomic64_read(&stats->seq_io_write_size));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_invalid",
+		    (int64_t)atomic64_read(&stats->seq_io_invalid));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_valid",
+		    (int64_t)atomic64_read(&stats->seq_io_valid));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_ioinp",
+		    (int64_t)atomic64_read(&stats->seq_io_ioinp));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_ioinp_cw",
+		    (int64_t)atomic64_read(&stats->seq_io_ioinp_cw));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_clean",
+		    (int64_t)atomic64_read(&stats->seq_io_clean));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_flushing",
+		    (int64_t)atomic64_read(&stats->seq_io_flushing));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_dirty",
+		    (int64_t)atomic64_read(&stats->seq_io_dirty));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_partdirty",
+		    (int64_t)atomic64_read(&stats->seq_io_partdirty));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_dirtyinp",
+		    (int64_t)atomic64_read(&stats->seq_io_dirtyinp));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_cleaninp",
+		    (int64_t)atomic64_read(&stats->seq_io_cleaninp));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_mdwrite",
+		    (int64_t)atomic64_read(&stats->seq_io_mdwrite));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_mdwrite_error",
+		    (int64_t)atomic64_read(&stats->seq_io_mdwrite_error));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_skip_flush",
+		    (int64_t)atomic64_read(&stats->seq_io_skip_flush));
+	seq_printf(seq, "%-26s %12lld\n", "seq_io_latency", stats->seq_io_latency);
 	return 0;
 }
 

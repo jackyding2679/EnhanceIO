@@ -60,7 +60,8 @@
 #include <linux/vmalloc.h>      /* for sysinfo (mem) variables */
 #include <linux/mm.h>
 #include <scsi/scsi_device.h>   /* required for SSD failure handling */
-#include <linux/sort.h>
+#include <linux/sort.h>         /* required for sorting flush*/
+#include <linux/rbtree.h>       /* required for detectiong sequential io*/
 /* resolve conflict with scsi/scsi_device.h */
 #ifdef QUEUED
 #undef QUEUED
@@ -79,6 +80,15 @@
 
 #define CONFIG_SRC_ADD_RESUME
 #define CONFIG_LOW_IO_PRESSURE_CLEAN 
+#define CONFIG_SKIP_SEQUENTIAL_IO
+
+#define EIO_VERIFY(x) do { \
+	if (unlikely(!(x))) { \
+		dump_stack(); \
+		panic("VERIFY: assertion (%s) failed at %s (%d)\n", \
+		      #x,  __FILE__ , __LINE__);		    \
+	} \
+} while(0)
 
 /*
  * It is to carry out 64bit division
@@ -584,6 +594,9 @@ struct mdupdate_request {
 #define SETFLAG_CLEAN_WHOLE     0x00000002      /* clean the set fully */
 #ifdef CONFIG_LOW_IO_PRESSURE_CLEAN
 #define SETFLAG_CLEAN_LOW_IO_PRESSURE     0x00000004      /* clean the set when low io pressure */
+#endif 
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+#define SETFLAG_SKIP_SEQUENTIAL_IO     0x00000008      /* sequential IO flag*/
 #endif
 /* Structure used for doing operations and storing cache set level info */
 struct cache_set {
@@ -645,6 +658,24 @@ struct eio_stats {
 	atomic64_t rdtime_ms;   /* total read time in ms */
 	atomic64_t readcount;   /* total reads received so far */
 	atomic64_t writecount;  /* total writes received so far */
+
+	atomic64_t seq_io_write_count;
+	atomic64_t seq_singleio_count;
+	atomic64_t seq_io_write_size;	
+	atomic64_t seq_io_invalid;	
+	atomic64_t seq_io_valid;	
+	atomic64_t seq_io_ioinp;	
+	atomic64_t seq_io_ioinp_cw;	/*IOinprogress cache write*/
+	atomic64_t seq_io_clean;		
+	atomic64_t seq_io_dirty;	
+	atomic64_t seq_io_flushing;	
+	atomic64_t seq_io_partdirty;	
+	atomic64_t seq_io_dirtyinp;	
+	atomic64_t seq_io_cleaninp;	
+	atomic64_t seq_io_mdwrite;
+	atomic64_t seq_io_mdwrite_error;
+	atomic64_t seq_io_skip_flush;
+	u_int64_t seq_io_latency;
 };
 
 #define PENDING_JOB_HASH_SIZE                   32
@@ -689,6 +720,10 @@ struct eio_sysctl {
 	uint32_t low_io_pressure_dirty_threshold;
 #endif
 	uint32_t enable_sort_flush;    /* enable or disable sort flush */
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+	uint32_t seqio_threshold_len_kb;
+	uint32_t seqio_bypass_len_kb;
+#endif
 
 };
 
@@ -708,6 +743,105 @@ struct eio_io_region {
 	sector_t sector;
 	sector_t count;         /* If zero the region is ignored */
 };
+
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+/*
+        |---threshold len---|---bypass len---|
+seqio-1 _____ _____________ ___________ ________                     4 IOs
+seqio-2 ___ _____ _______ ___ ___ _____                              6 IOS
+seqio-3 ___ _______________________ _________________________        3 IOs
+seqio-4 _________ ________ ________________ _____________ __________ 5 IOs
+seqio-5 _______ _________                                            2 IOs
+
+number of IO reach threshold:18
+number of IO reach bypass:12
+percent = 12/18 * 100%
+*/
+
+#define TO_KB(bytes)				((bytes) >> 10)
+#define SEQIO_SINGLE_IO_BYPASS_LEN_KB 128
+#define SEQIO_THRESHOLD_LEN_KB 	128			/* 0 = cache all, >0 = dont cache sequential i/o more than this (kb) */
+#define SEQIO_BYPASS_LEN_KB 	256	
+#define SEQIO_HASH_SIZE_BYTE		1024 * 1024 * 1024UL /*1GB*/
+#define SEQIO_TRACKER_QUEUE_DEPTH	128	/* How many io 'flows' to track */
+#define SEQIO_HAZE_SIZE_1GB_SHIFT 	(30)
+#define SEQIO_SYSCTL_NR 1
+#define SEQIO_UPDATE_PCT_INTERVAL	10 * HZ
+#define SEQIO_UPDATE_PCT_COUNT		400
+#define SEQIO_SKIP_PCT_THRESHOLD	70 /*80% */
+#define SEQIO_SMALL_IO_PCT			95 /*95% */
+#define SEQIO_SMALL_IO_COUNT		1000 /*95% */
+#define SEQIO_SKIP_DECTECT_BIO_SIZE 	32 /*32 KB*/
+
+struct seqio_prediction {
+	u_int32_t threshold_io_count;/*the number of IO that reach the length of threshold*/
+	u_int32_t bypass_io_count;/*the number of IO that reach the length of bypass*/
+	bool skip;
+	unsigned long calc_time;
+};
+struct seqio_lru_node {
+ 	sector_t 		most_recent_sector;
+	unsigned long	last_bio_size;
+	unsigned long	sequential_size_bytes;
+	unsigned long 	node_id;
+	unsigned long 	io_count;
+	int 			threshold_flag;
+	int 			bypass_flag;
+	/* We use LRU replacement when we need to record a new i/o 'flow' */
+	struct seqio_lru_node 	*prev, *next;
+};
+
+struct seqio_hash_node {
+	struct seqio_lru_node lru_nodes[SEQIO_TRACKER_QUEUE_DEPTH];
+	struct seqio_lru_node *lru_node_head;
+	struct seqio_lru_node *lru_node_tail;
+};
+
+struct seqio_set_block {
+	index_t set_index; /**/
+	index_t block_index[256]; /*dirty block index*/
+	u_int32_t block_nr; /*dirty block number*/
+	//struct work_struct work;        /* work structure */
+	struct bio_container *bc; 	
+	unsigned mdbvec_count;          /* count of bvecs allocated. */
+	struct bio_vec *mdblk_bvecs; /*bvec to update metadate*/
+	int error;
+	atomic_t holdcount;
+	struct seqio_set_block *next;	
+};
+struct seqio_set_block_t {
+	struct work_struct work;        /* work structure */
+	struct bio_container *bc; 
+	index_t set_index;
+	index_t *dirty_blocks;
+	u_int32_t block_nr;
+	struct seqio_set_block *next;	
+	unsigned mdbvec_count;          /* count of bvecs allocated. */
+	struct bio_vec *mdblk_bvecs;
+	int error;
+	atomic_t holdcount;
+};
+void seq_io_remove_from_lru(struct seqio_hash_node *hash_node, 
+									   struct seqio_lru_node *lru_node);
+
+void seq_io_move_to_lruhead(struct seqio_hash_node *hash_node, 
+                                       struct seqio_lru_node *lru_node);
+
+int seq_io_move_to_hash_node(struct seqio_hash_node *old_hash_node, 
+							  struct seqio_hash_node *new_hash_node, 
+							  struct seqio_lru_node *lru_node);
+#if 0
+/*user rbtree to track IOs*/
+struct seqio_node {
+	struct rb_node rb;
+ 	sector_t 		most_recent_sector;
+	unsigned long	last_bio_size;
+	unsigned long	sequential_size_bytes;
+};
+#endif
+#else
+#define SEQ_IO_SYSCTL_NR 0
+#endif
 
 /*
  * Cache context
@@ -813,7 +947,7 @@ struct cache_c {
 	struct delayed_work low_pressure_clean_work;   /* work to clean sets when io pressure is low*/
 	struct set_nr_dirty_pair *set_dirty_sort;
 	u_int32_t low_io_pressure_sched_interval;
-	int is_low_pressure_clean_work_sched;
+	int is_low_pressure_clean_work_sched;
 	atomic_t flag_rm_sets;
 	int64_t last_ioc;
 	u_int64_t last_rwms;
@@ -823,14 +957,35 @@ struct cache_c {
 #ifdef CONFIG_SRC_ADD_RESUME
 	u_int32_t cached_blocks_tmp;
 #endif
+
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+	#define SEQIO_HASH_TBL_SIZE 10 /*size of hash table*/
+	//struct seqio_hash_node seqio_hashtbl[SEQIO_HASH_TBL_SIZE];	
+	struct seqio_hash_node seqio;	
+	//struct seqio_lru_node lru_nodes[SEQIO_TRACKER_QUEUE_DEPTH];
+	//struct seqio_lru_node *lru_node_head;
+	//struct seqio_lru_node *lru_node_tail;
+	
+	struct seqio_prediction io_predict;
+	spinlock_t seq_io_lock;
+	//struct rb_root seqio_rbroot;
+	//u_int32_t rbnode_count;
+	//spinlock_t seqio_rbtree_lock;
+	atomic64_t seq_io_count; /*for calc io latency statistic*/
+	atomic64_t seq_io_ms; /*for calc io latency statistic*/
+	unsigned long 	node_id;
+	uint32_t seqio_threshold_bypass_kb;/*threshold+bypass*/
+
+	
+	atomic64_t wr_ioc; /*for calc io latency statistic*/	
+	atomic64_t wr_ioc_small; /*for calc io latency statistic*/
+	unsigned long pct_update_time;
+	int detect_flag;
+	//spinlock_t wr_ioc_lock;                  /* spinlock for dirty set lru */
+#endif
+
 	/*dbg ctl*/
 	int log_level;
-	/*issues 2253*/
-	spinlock_t bc_free_lock;
-	spinlock_t bc_id_lock;
-	u_int64_t bc_id;
-
-    struct rw_semaphore muti_set_op_protect; 
 };
 
 #define EIO_CACHE_IOSIZE                0
@@ -912,7 +1067,6 @@ enum eio_io_dir {
 /* ASK
  * Container for all eio_bio corresponding to a given bio
  */
-#define BC_MAGIC 0xfeedcace
 struct bio_container {
 	spinlock_t bc_lock;                     /* lock protecting the bc fields */
 	atomic_t bc_holdcount;                  /* number of ebios referencing bc */
@@ -927,9 +1081,13 @@ struct bio_container {
 	int bc_error;                           /* error encountered during processing bc */
 	unsigned long bc_iotime;                /* maintains i/o time in jiffies */
 	struct bio_container *bc_next;          /* next bc in the chain */
-	/*fix issues 2253*/
-	atomic64_t bc_id;
-	u_int32_t bc_magic;
+	
+#ifdef CONFIG_SKIP_SEQUENTIAL_IO
+	struct seqio_set_block *set_block; /*invalidate dirty block when skip seq IO*/
+	//atomic_t nr_set_block;
+	u_int32_t nr_set_block;
+	unsigned long bc_locktime; 
+#endif
 };
 
 /* structure used as callback context during synchronous I/O */
@@ -1217,7 +1375,7 @@ enum {
 #define EIO_DBG(level, dmc, fmt, arg...)	\
 	do {                                         \
 		if ((dmc)->log_level >= EIO_LOG_LEVEL_##level) {      \
-			printk(KERN_ERR DBG_PREFIX":%s:" fmt "\n",(dmc)->cache_name, ##arg); \
+			printk(KERN_ERR DBG_PREFIX":%s:" fmt ,(dmc)->cache_name, ##arg); \
 		}     \
 	} while (0)
 #else
@@ -1263,6 +1421,7 @@ int eio_handle_src_message(char *cache_name, char *ssd_name,
 				  enum dev_notifier note);
 int eio_activate_src_add(struct cache_c *dmc, struct eio_bdev *prev_dev);
 #endif
+
 
 #endif                     
 
